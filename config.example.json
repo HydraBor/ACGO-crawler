@@ -1,0 +1,24 @@
+{
+  "targets": ["homework", "contest"],
+  "homework": {
+    "id": "10001",
+    "teamCode": "1000000000000000000"
+  },
+  "contest": {
+    "id": "20001",
+    "matchRoundId": "20001",
+    "openLevel": 3,
+    "teamCode": "1000000000000000000"
+  },
+  "sessionName": "ACGO-代码证据包",
+  "dailySummaryPath": "今日总结.md",
+  "cdpUrl": "http://127.0.0.1:9222",
+  "outputDirectory": "output",
+  "cleanOutput": true,
+  "navigationTimeoutMs": 30000,
+  "actionDelayMs": 500,
+  "questionApiConcurrency": 4,
+  "apiRetryCount": 3,
+  "maxRankingPages": 100,
+  "saveDebugFiles": false
+}

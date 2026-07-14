@@ -1,0 +1,21 @@
+{
+  "name": "acgo-crawler",
+  "version": "1.7.0",
+  "private": true,
+  "type": "module",
+  "description": "Export authorized ACGO homework and contest evidence packages for student feedback generation.",
+  "scripts": {
+    "start": "node src/index.mjs --config config.json",
+    "inspect": "node src/index.mjs --config config.json --inspect-only",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "playwright-core": "^1.53.0",
+    "sanitize-filename": "^1.6.3",
+    "turndown": "^7.2.0",
+    "turndown-plugin-gfm": "^1.0.2"
+  }
+}

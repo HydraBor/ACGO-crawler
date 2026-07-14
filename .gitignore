@@ -1,0 +1,11 @@
+node_modules/
+config.json
+output/
+*.log
+.env
+.env.*
+*.local.json
+今日总结.md
+.DS_Store
+.vscode/
+.idea/
