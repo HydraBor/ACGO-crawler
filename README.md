@@ -2,15 +2,16 @@
 
 把 ACGO 团队作业和比赛数据整理成适合提交给 AI 的 Markdown 证据包，用来生成每个学生当天给家长看的反馈。工具会采集题面、排行榜、每题得分、提交次数以及每次提交的完整代码，并结合老师手写的 `今日总结.md` 生成提示词。
 
-当前版本：`1.7.0`
+当前版本：`1.8.0`
 
 ## 功能
 
 - 支持只爬作业、只爬比赛，或同时爬取两部分。
 - 作业只需要配置 `homework.id` 和 `homework.teamCode`。
-- 比赛只需要配置 `contest.id`、`contest.matchRoundId`、`contest.openLevel` 和 `contest.teamCode`；`contest.examId` 可选，缺省时会自动识别。
+- 比赛只需要配置 `contest.id`、`contest.openLevel` 和 `contest.teamCode`；`contest.matchRoundId` 默认等于 `contest.id`，`contest.examId` 可选且会自动识别。
 - 作业排行榜通过 ACGO 接口按 `pages/total` 自动翻页。
 - 比赛排行榜按 `page=1,2,3...` 逐页读取并合并，避免漏掉第二页之后的学生。
+- 题面和提交代码支持可控并发读取，人数较多时导出速度更快。
 - 每个学生分别生成 `课堂练习.md` 和 `今日比赛.md`，两类文件结构一致。
 - 学生提交记录只保留反馈需要的结果、时间、语言、内存和代码。
 
@@ -96,7 +97,6 @@ copy 今日总结.example.md 今日总结.md
   },
   "contest": {
     "id": "20001",
-    "matchRoundId": "20001",
     "openLevel": 2,
     "teamCode": "1000000000000000000"
   },
@@ -106,13 +106,26 @@ copy 今日总结.example.md 今日总结.md
   "outputDirectory": "output",
   "cleanOutput": true,
   "navigationTimeoutMs": 30000,
-  "actionDelayMs": 500,
+  "pageSettleDelayMs": 300,
+  "actionDelayMs": 100,
   "questionApiConcurrency": 4,
+  "submissionApiConcurrency": 4,
+  "submissionDetailConcurrency": 3,
   "apiRetryCount": 3,
   "maxRankingPages": 100,
   "saveDebugFiles": false
 }
 ```
+
+速度相关配置：
+
+- `questionApiConcurrency`：题面接口并发数。
+- `submissionApiConcurrency`：学生题目提交列表并发数。
+- `submissionDetailConcurrency`：单题多次提交代码详情并发数。
+- `actionDelayMs`：接口任务之间的轻量等待；如果遇到临时失败或限流，可以适当调高。
+- `pageSettleDelayMs`：页面跳转后的稳定等待时间。
+
+`contest.matchRoundId` 通常和 `contest.id` 一样，默认不需要写；只有当 ACGO 链接里这两个值明确不同时再手动补充。
 
 只爬作业：
 
@@ -133,7 +146,6 @@ copy 今日总结.example.md 今日总结.md
   "targets": ["contest"],
   "contest": {
     "id": "20001",
-    "matchRoundId": "20001",
     "openLevel": 2,
     "teamCode": "1000000000000000000"
   }

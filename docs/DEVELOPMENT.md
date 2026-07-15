@@ -26,14 +26,13 @@
   },
   "contest": {
     "id": "20001",
-    "matchRoundId": "20001",
     "openLevel": 2,
     "teamCode": "1000000000000000000"
   }
 }
 ```
 
-`contest.examId` 可选。缺省时，程序会打开比赛页面并从页面链接或 `contestInfo.matchRounds.programExamId` 中识别。
+`contest.matchRoundId` 默认等于 `contest.id`，通常无需填写；只有 ACGO 链接里两个值明确不同时才需要手动补充。`contest.examId` 可选，缺省时程序会打开比赛页面并从页面链接或 `contestInfo.matchRounds.programExamId` 中识别。
 
 ## 主流程
 
@@ -50,7 +49,7 @@
 - 题面：优先通过 Next Data 并发读取；单题失败时才对该题做页面解析。
 - 排行榜：调用 `/acgoPms/api/team/{teamCode}/homework/ranking/{homeworkId}`，按接口返回的 `pages` 自动翻页。
 - 题目分值：调用 `/acgoPms/api/team/{teamCode}/homework/getQuestionScore/{homeworkId}`。
-- 提交代码：调用作业 `questionAnswerRecord/list` 和 `questionAnswerRecord/view` 接口，保留每次提交的完整代码。
+- 提交代码：调用作业 `questionAnswerRecord/list` 和 `questionAnswerRecord/view` 接口，按 `submissionApiConcurrency` 和 `submissionDetailConcurrency` 控制并发，保留每次提交的完整代码。
 
 ## 比赛采集
 
@@ -58,7 +57,7 @@
 - 题目列表：调用 `/acgoMatch/leaderboard/questionList`，使用 `acgoQuestionId` 构造题面地址。
 - 题面：通过 Next Data 并发读取。
 - 排行榜：逐页打开比赛排行榜 `page=1,2,3...`，读取每页 `__NEXT_DATA__.props.pageProps.listData` 并按 `userId` 合并。
-- 提交代码：调用比赛 `questionAnswerRecord/list` 和 `questionAnswerRecord/matchView` 接口。
+- 提交代码：调用比赛 `questionAnswerRecord/list` 和 `questionAnswerRecord/matchView` 接口，读取逻辑与作业提交保持一致的可控并发。
 
 ## 输出约定
 

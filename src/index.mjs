@@ -286,7 +286,7 @@ async function gotoStable(page, url) {
     }
   }
   await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
-  await page.waitForTimeout(500);
+  await page.waitForTimeout(pageSettleDelayMs());
 }
 
 async function ensureLoggedIn(page) {
@@ -393,8 +393,8 @@ async function collectHomeworkDataset(page, api) {
   const students = new Map();
   for (const student of ranking.students) students.set(student.key, { ...student, submissions: [] });
 
-  for (let index = 0; index < ranking.detailEntries.length; index++) {
-    const entry = ranking.detailEntries[index];
+  const homeworkSubmissionTasks = ranking.detailEntries;
+  await mapWithConcurrency(homeworkSubmissionTasks, submissionApiConcurrency(), async (entry, index) => {
     console.log(`读取作业提交 ${index + 1}/${ranking.detailEntries.length}：${entry.username} / ${entry.questionTitle}`);
     let submissions = [];
     try {
@@ -418,8 +418,8 @@ async function collectHomeworkDataset(page, api) {
       questionKey: entry.questionKey
     })));
     students.set(entry.studentKey, student);
-    await delay(config.actionDelayMs);
-  }
+    await delay(requestDelayMs());
+  });
 
   for (const student of students.values()) {
     student.submissions = dedupeSubmissions(student.submissions);
@@ -504,7 +504,7 @@ async function collectProblems(page, questionLinks, options = {}) {
     return results;
   }, {
     requests: requests.map(request => ({ dataUrl: request.dataUrl })),
-    concurrency: Number(config.questionApiConcurrency || 4)
+    concurrency: positiveInteger(config.questionApiConcurrency, 4)
   });
 
   const problems = new Array(questionLinks.length);
@@ -530,7 +530,7 @@ async function collectProblems(page, questionLinks, options = {}) {
     await gotoStable(page, failure.item.url);
     const problem = await extractProblem(page);
     problems[failure.index] = { ...failure.item, ...problem };
-    await delay(config.actionDelayMs);
+    await delay(requestDelayMs());
   }
   return problems;
 }
@@ -543,7 +543,7 @@ async function collectProblemsFromPages(page, questionLinks) {
     await gotoStable(page, item.url);
     const problem = await extractProblem(page);
     problems.push({ ...item, ...problem });
-    await delay(config.actionDelayMs);
+    await delay(requestDelayMs());
   }
   return problems;
 }
@@ -647,17 +647,15 @@ async function collectSubmissionAttemptsFromApi(api, entry) {
     return timeDifference || Number(left.id || 0) - Number(right.id || 0);
   });
   const attemptById = new Map(sortedRecords.map((record, index) => [String(record.id), index + 1]));
-  const submissions = [];
-
-  for (const record of sortedRecords) {
+  const submissions = await mapWithConcurrency(sortedRecords, submissionDetailConcurrency(), async record => {
     const detail = await api.post(viewEndpoint, {
       teamCode,
       id: Number(record.id),
       homeworkId: Number(homeworkId)
     });
     const code = Array.isArray(detail?.answer) ? String(detail.answer[0] || '') : String(detail?.answer || '');
-    if (!code) continue;
-    submissions.push({
+    if (!code) return null;
+    return {
       submissionId: String(record.id),
       questionTitle: entry.questionTitle,
       attempt: String(attemptById.get(String(record.id)) || ''),
@@ -667,9 +665,9 @@ async function collectSubmissionAttemptsFromApi(api, entry) {
       memory: formatMemory(detail?.maxUsedMemory),
       submittedAt: formatSubmissionTime(detail?.createdAt ?? record.createdAt),
       code: code.replace(/\r\n/g, '\n')
-    });
-  }
-  return submissions;
+    };
+  });
+  return sortSubmissionsByAttempt(submissions.filter(Boolean));
 }
 
 async function collectContestDataset(page, api, contest) {
@@ -746,7 +744,7 @@ async function collectContestRankingPages(page, rankingUrl) {
     const pageRecords = Array.isArray(pageProps.listData?.list) ? pageProps.listData.list : [];
     if (!pageRecords.length) break;
     records.push(...pageRecords);
-    await delay(config.actionDelayMs);
+    await delay(requestDelayMs());
   }
 
   const uniqueRecords = uniqueBy(records, contestRankingRecordKey);
@@ -787,20 +785,17 @@ function contestRankingRecordKey(record) {
 }
 
 async function collectContestQuestionLinks(page, { questionList, pageProps, contestTeamCode }) {
-  const domLinks = await collectQuestionLinks(page, { allowEmpty: true });
-  if (domLinks.length) return domLinks;
-
   const apiLinks = buildContestQuestionLinksFromList(questionList, contestTeamCode);
-  if (apiLinks.length) {
-    console.log('比赛题目页没有直接题目链接，已改用比赛题目接口生成题面链接。');
-    return apiLinks;
-  }
+  if (apiLinks.length) return apiLinks;
 
   const nextLinks = buildContestQuestionLinksFromList(pageProps?.questionList, contestTeamCode);
   if (nextLinks.length) {
-    console.log('比赛题目页没有直接题目链接，已改用页面 Next Data 生成题面链接。');
+    console.log('比赛题面链接已通过页面数据生成。');
     return nextLinks;
   }
+
+  const domLinks = await collectQuestionLinks(page, { allowEmpty: true });
+  if (domLinks.length) return domLinks;
 
   await saveDebugPage(page, '未识别到比赛题目链接');
   throw new Error('没有识别到比赛题目链接，也没有从比赛题目接口中拿到 acgoQuestionId。请运行 npm run inspect，并检查 debug 目录。');
@@ -886,34 +881,37 @@ async function collectContestSubmissions(api, dataset, contestTeamCode, rankingU
     return;
   }
 
-  const totalEntries = dataset.students.reduce((count, student) => (
-    count + student.problemResults.filter(result => Number(result.submitCount) > 0).length
-  ), 0);
+  const tasks = dataset.students.flatMap(student => {
+    student.submissions = [];
+    return student.problemResults
+      .filter(result => Number(result.submitCount) > 0)
+      .map(result => ({ student, result }));
+  });
   let cursor = 0;
 
-  for (const student of dataset.students) {
-    student.submissions = [];
-    for (const result of student.problemResults) {
-      if (!Number(result.submitCount)) continue;
-      cursor++;
-      console.log(`读取比赛提交 ${cursor}/${totalEntries}：${student.username} / T${result.index} ${result.title}`);
-      try {
-        const submissions = await collectContestSubmissionAttemptsFromApi(api, {
-          teamCode: contestTeamCode,
-          examId,
-          userId: student.userId,
-          questionId: result.questionId,
-          questionKey: result.questionKey,
-          questionTitle: `第${result.index}题：${result.title}`
-        });
-        result.submissions = submissions;
-        student.submissions.push(...submissions);
-      } catch (error) {
-        console.warn(`  比赛提交读取失败：${error.message}`);
-        result.submissions = [];
-      }
-      await delay(config.actionDelayMs);
+  await mapWithConcurrency(tasks, submissionApiConcurrency(), async ({ student, result }) => {
+    const current = ++cursor;
+    console.log(`读取比赛提交 ${current}/${tasks.length}：${student.username} / T${result.index} ${result.title}`);
+    try {
+      const submissions = await collectContestSubmissionAttemptsFromApi(api, {
+        teamCode: contestTeamCode,
+        examId,
+        userId: student.userId,
+        questionId: result.questionId,
+        questionKey: result.questionKey,
+        questionTitle: `第${result.index}题：${result.title}`
+      });
+      result.submissions = submissions;
+      student.submissions.push(...submissions);
+    } catch (error) {
+      console.warn(`  比赛提交读取失败：${error.message}`);
+      result.submissions = [];
     }
+    await delay(requestDelayMs());
+  });
+
+  for (const student of dataset.students) {
+    student.submissions = sortSubmissionsByAttempt(dedupeSubmissions(student.submissions));
     student.summary.totalSubmitCount = student.submissions.length;
   }
 }
@@ -932,16 +930,14 @@ async function collectContestSubmissionAttemptsFromApi(api, entry) {
     return timeDifference || Number(left.id || 0) - Number(right.id || 0);
   });
   const attemptById = new Map(sortedRecords.map((record, index) => [String(record.id), index + 1]));
-  const submissions = [];
-
-  for (const record of sortedRecords) {
+  const submissions = await mapWithConcurrency(sortedRecords, submissionDetailConcurrency(), async record => {
     const detail = await api.post(viewEndpoint, {
       teamCode: entry.teamCode,
       id: String(record.id)
     });
     const code = Array.isArray(detail?.answer) ? String(detail.answer[0] || '') : String(detail?.answer || record.answer?.[0] || '');
-    if (!code) continue;
-    submissions.push({
+    if (!code) return null;
+    return {
       submissionId: String(record.id),
       questionTitle: entry.questionTitle,
       questionKey: entry.questionKey,
@@ -954,9 +950,9 @@ async function collectContestSubmissionAttemptsFromApi(api, entry) {
       score: detail?.score ?? record.score ?? '',
       scoringRate: detail?.scoringRate || record.scoringRate || '',
       code: code.replace(/\r\n/g, '\n')
-    });
-  }
-  return sortSubmissionsByAttempt(dedupeSubmissions(submissions));
+    };
+  });
+  return sortSubmissionsByAttempt(dedupeSubmissions(submissions.filter(Boolean)));
 }
 
 function buildContestDataset({ id, questionUrl, rankingUrl, rawProblems, pageProps, questionList }) {
@@ -1610,6 +1606,44 @@ function uniqueBy(items, keyOf) {
   const map = new Map();
   for (const item of items) map.set(keyOf(item), item);
   return [...map.values()];
+}
+
+async function mapWithConcurrency(items, concurrency, worker) {
+  const list = [...(items || [])];
+  if (!list.length) return [];
+
+  const results = new Array(list.length);
+  let cursor = 0;
+  const workerCount = Math.max(1, Math.min(positiveInteger(concurrency, 1), list.length));
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (true) {
+      const index = cursor++;
+      if (index >= list.length) return;
+      results[index] = await worker(list[index], index);
+    }
+  }));
+  return results;
+}
+
+function submissionApiConcurrency() {
+  return positiveInteger(config.submissionApiConcurrency ?? config.submissionConcurrency, 4);
+}
+
+function submissionDetailConcurrency() {
+  return positiveInteger(config.submissionDetailConcurrency, 3);
+}
+
+function requestDelayMs() {
+  return Math.max(0, Number(config.actionDelayMs ?? 100) || 0);
+}
+
+function pageSettleDelayMs() {
+  return Math.max(0, Number(config.pageSettleDelayMs ?? 300) || 0);
+}
+
+function positiveInteger(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? Math.floor(number) : fallback;
 }
 
 async function writeJson(filename, value) {

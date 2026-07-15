@@ -68,7 +68,6 @@ copy 今日总结.example.md 今日总结.md
   },
   "contest": {
     "id": "20001",
-    "matchRoundId": "20001",
     "openLevel": 2,
     "teamCode": "1000000000000000000"
   },
@@ -78,8 +77,11 @@ copy 今日总结.example.md 今日总结.md
   "outputDirectory": "output",
   "cleanOutput": true,
   "navigationTimeoutMs": 30000,
-  "actionDelayMs": 500,
+  "pageSettleDelayMs": 300,
+  "actionDelayMs": 100,
   "questionApiConcurrency": 4,
+  "submissionApiConcurrency": 4,
+  "submissionDetailConcurrency": 3,
   "apiRetryCount": 3,
   "maxRankingPages": 100,
   "saveDebugFiles": false
@@ -94,6 +96,9 @@ copy 今日总结.example.md 今日总结.md
 - 保留旧输出：`"cleanOutput": false`
 - 保存调试页面：`"saveDebugFiles": true`
 - 限制最多分页：`"maxRankingPages": 100`
+- 提高读取速度：适当调高 `questionApiConcurrency`、`submissionApiConcurrency`、`submissionDetailConcurrency`
+- 遇到接口临时失败：适当降低并发，或调高 `actionDelayMs`
+- 比赛轮次 ID：`contest.matchRoundId` 默认等于 `contest.id`，通常不用填写
 
 ## 每日使用流程
 
@@ -153,7 +158,7 @@ npm test
 
 ### 比赛缺少 `examId`
 
-保留 `contest.id`、`matchRoundId`、`openLevel` 和 `teamCode`，运行 `npm run inspect`。脚本会尽量从页面里自动补出 `examId`。如果仍失败，可以把排行榜链接中的 `examId` 手动填入 `contest.examId`。
+保留 `contest.id`、`openLevel` 和 `teamCode`，运行 `npm run inspect`。脚本会尽量从页面里自动补出 `examId`。如果仍失败，可以把排行榜链接中的 `examId` 手动填入 `contest.examId`。
 
 ### 排行榜人数不完整
 

@@ -6,7 +6,6 @@
   },
   "contest": {
     "id": "20001",
-    "matchRoundId": "20001",
     "openLevel": 3,
     "teamCode": "1000000000000000000"
   },
@@ -16,8 +15,11 @@
   "outputDirectory": "output",
   "cleanOutput": true,
   "navigationTimeoutMs": 30000,
-  "actionDelayMs": 500,
+  "pageSettleDelayMs": 300,
+  "actionDelayMs": 100,
   "questionApiConcurrency": 4,
+  "submissionApiConcurrency": 4,
+  "submissionDetailConcurrency": 3,
   "apiRetryCount": 3,
   "maxRankingPages": 100,
   "saveDebugFiles": false
