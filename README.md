@@ -2,13 +2,13 @@
 
 把 ACGO 团队作业和比赛数据整理成适合提交给 AI 的 Markdown 证据包，用来生成每个学生当天给家长看的反馈。工具会采集题面、排行榜、每题得分、提交次数以及每次提交的完整代码，并结合老师手写的 `今日总结.md` 生成提示词。
 
-当前版本：`1.8.0`
+当前版本：`1.9.0`
 
 ## 功能
 
 - 支持只爬作业、只爬比赛，或同时爬取两部分。
 - 作业只需要配置 `homework.id` 和 `homework.teamCode`。
-- 比赛只需要配置 `contest.id`、`contest.openLevel` 和 `contest.teamCode`；`contest.matchRoundId` 默认等于 `contest.id`，`contest.examId` 可选且会自动识别。
+- 比赛只需要配置 `contest.id` 和 `contest.teamCode`；程序会先访问比赛详情页，再自动识别 `examId`、`openLevel` 和 `matchRoundId`。
 - 作业排行榜通过 ACGO 接口按 `pages/total` 自动翻页。
 - 比赛排行榜按 `page=1,2,3...` 逐页读取并合并，避免漏掉第二页之后的学生。
 - 题面和提交代码支持可控并发读取，人数较多时导出速度更快。
@@ -97,7 +97,6 @@ copy 今日总结.example.md 今日总结.md
   },
   "contest": {
     "id": "20001",
-    "openLevel": 2,
     "teamCode": "1000000000000000000"
   },
   "sessionName": "ACGO-代码证据包",
@@ -125,7 +124,7 @@ copy 今日总结.example.md 今日总结.md
 - `actionDelayMs`：接口任务之间的轻量等待；如果遇到临时失败或限流，可以适当调高。
 - `pageSettleDelayMs`：页面跳转后的稳定等待时间。
 
-`contest.matchRoundId` 通常和 `contest.id` 一样，默认不需要写；只有当 ACGO 链接里这两个值明确不同时再手动补充。
+比赛入口默认使用 `https://www.acgo.cn/contest/detail/<contest.id>?teamCode=<contest.teamCode>`。`contest.matchRoundId`、`contest.examId`、`contest.openLevel` 通常都不需要写；只有当 ACGO 页面无法自动识别时再手动补充。
 
 只爬作业：
 
@@ -146,7 +145,6 @@ copy 今日总结.example.md 今日总结.md
   "targets": ["contest"],
   "contest": {
     "id": "20001",
-    "openLevel": 2,
     "teamCode": "1000000000000000000"
   }
 }

@@ -68,7 +68,6 @@ copy 今日总结.example.md 今日总结.md
   },
   "contest": {
     "id": "20001",
-    "openLevel": 2,
     "teamCode": "1000000000000000000"
   },
   "sessionName": "ACGO-代码证据包",
@@ -98,7 +97,8 @@ copy 今日总结.example.md 今日总结.md
 - 限制最多分页：`"maxRankingPages": 100`
 - 提高读取速度：适当调高 `questionApiConcurrency`、`submissionApiConcurrency`、`submissionDetailConcurrency`
 - 遇到接口临时失败：适当降低并发，或调高 `actionDelayMs`
-- 比赛轮次 ID：`contest.matchRoundId` 默认等于 `contest.id`，通常不用填写
+- 比赛入口：默认用 `contest.id` 和 `contest.teamCode` 打开比赛详情页，其余参数自动识别
+- 比赛高级参数：`contest.matchRoundId`、`contest.examId`、`contest.openLevel` 通常不用填写
 
 ## 每日使用流程
 
@@ -158,7 +158,7 @@ npm test
 
 ### 比赛缺少 `examId`
 
-保留 `contest.id`、`openLevel` 和 `teamCode`，运行 `npm run inspect`。脚本会尽量从页面里自动补出 `examId`。如果仍失败，可以把排行榜链接中的 `examId` 手动填入 `contest.examId`。
+保留 `contest.id` 和 `teamCode`，运行 `npm run inspect`。脚本会先访问比赛详情页，并尽量从页面里自动补出 `examId`。如果仍失败，可以把排行榜链接中的 `examId` 手动填入 `contest.examId`。
 
 ### 排行榜人数不完整
 

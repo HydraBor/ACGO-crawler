@@ -26,13 +26,12 @@
   },
   "contest": {
     "id": "20001",
-    "openLevel": 2,
     "teamCode": "1000000000000000000"
   }
 }
 ```
 
-`contest.matchRoundId` 默认等于 `contest.id`，通常无需填写；只有 ACGO 链接里两个值明确不同时才需要手动补充。`contest.examId` 可选，缺省时程序会打开比赛页面并从页面链接或 `contestInfo.matchRounds.programExamId` 中识别。
+比赛入口默认是 `contest/detail/{id}?teamCode={teamCode}`。`contest.matchRoundId` 默认等于 `contest.id`，`contest.examId` 和 `contest.openLevel` 会从详情页链接或 `contestInfo.matchRounds.programExamId`、`contestInfo.openLevel` 中识别；只有 ACGO 页面无法自动识别时才需要手动补充。
 
 ## 主流程
 
@@ -53,7 +52,8 @@
 
 ## 比赛采集
 
-- `examId`：优先使用配置，其次从比赛页面自动识别。
+- 比赛入口：先访问详情页，再解析题目页、排行榜、`examId`、`openLevel` 和 `matchRoundId`。
+- `examId`：优先使用配置，其次从比赛详情页或页面链接自动识别。
 - 题目列表：调用 `/acgoMatch/leaderboard/questionList`，使用 `acgoQuestionId` 构造题面地址。
 - 题面：通过 Next Data 并发读取。
 - 排行榜：逐页打开比赛排行榜 `page=1,2,3...`，读取每页 `__NEXT_DATA__.props.pageProps.listData` 并按 `userId` 合并。

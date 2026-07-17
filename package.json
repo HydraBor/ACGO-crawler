@@ -1,6 +1,6 @@
 {
   "name": "acgo-crawler",
-  "version": "1.8.0",
+  "version": "1.9.0",
   "private": true,
   "type": "module",
   "description": "Export authorized ACGO homework and contest evidence packages for student feedback generation.",

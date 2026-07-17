@@ -208,6 +208,7 @@ function buildContestConfig(value) {
     examId,
     openLevel,
     teamCode: currentTeamCode,
+    detailUrl: source.detailUrl || buildContestUrl({ contestId: id, teamCode: currentTeamCode, page: 'detail' }),
     questionUrl: buildContestUrl({ ...base, page: 'question' }),
     rankingUrl: buildContestUrl({ ...base, page: 'ranking' }),
     label: source.label || '今日比赛'
@@ -347,10 +348,13 @@ async function inspectConfiguredPages(page, api, responseStore) {
   }
 
   if (contestConfig) {
-    console.log('诊断：读取比赛题目入口…');
-    await gotoStable(page, contestConfig.questionUrl);
+    console.log('诊断：读取比赛入口…');
+    await gotoStable(page, contestConfig.detailUrl || contestConfig.questionUrl);
     await ensureLoggedIn(page);
     const resolvedContest = await resolveContestConfigFromPage(page, contestConfig);
+
+    console.log('诊断：读取比赛题目入口…');
+    await gotoStable(page, resolvedContest.questionUrl);
     await saveDebugPage(page, 'inspect-比赛题目入口');
 
     console.log('诊断：读取比赛排行榜入口…');
@@ -358,6 +362,7 @@ async function inspectConfiguredPages(page, api, responseStore) {
     await saveDebugPage(page, 'inspect-比赛排行榜入口');
     report.contest = {
       id: resolvedContest.id,
+      detailUrl: resolvedContest.detailUrl,
       questionUrl: resolvedContest.questionUrl,
       rankingUrl: resolvedContest.rankingUrl,
       pagePropKeys: Object.keys(pageProps),
@@ -673,6 +678,11 @@ async function collectSubmissionAttemptsFromApi(api, entry) {
 async function collectContestDataset(page, api, contest) {
   let runtimeContest = { ...contest };
 
+  console.log('读取今日比赛入口…');
+  await gotoStable(page, runtimeContest.detailUrl || runtimeContest.questionUrl);
+  await ensureLoggedIn(page);
+  runtimeContest = await resolveContestConfigFromPage(page, runtimeContest);
+
   console.log('读取今日比赛题目列表…');
   await gotoStable(page, runtimeContest.questionUrl);
   await ensureLoggedIn(page);
@@ -827,33 +837,89 @@ function contestProblemQuestionId(question) {
 async function resolveContestConfigFromPage(page, contest) {
   const resolved = await page.evaluate(() => {
     const links = [...document.querySelectorAll('a[href]')].map(anchor => anchor.href);
-    const questionUrl = links.find(href => /\/contest\/question\//.test(href) && /examId=/.test(href)) || '';
-    const rankingUrl = links.find(href => /\/contest\/ranking\//.test(href) && /examId=/.test(href)) || '';
+    const questionUrl = links.find(href => /\/contest\/question\//.test(href) && /examId=/.test(href))
+      || links.find(href => /\/contest\/question\//.test(href))
+      || '';
+    const rankingUrl = links.find(href => /\/contest\/ranking\//.test(href) && /examId=/.test(href))
+      || links.find(href => /\/contest\/ranking\//.test(href))
+      || '';
+    const detailUrl = links.find(href => /\/contest\/detail\//.test(href) && /examId=/.test(href))
+      || links.find(href => /\/contest\/detail\//.test(href))
+      || location.href;
     let examId = '';
+    let matchRoundId = '';
+    let openLevel = '';
     try {
       const props = JSON.parse(document.querySelector('#__NEXT_DATA__')?.textContent || '{}')?.props?.pageProps || {};
-      examId = String(props.contestInfo?.matchRounds?.programExamId || props.contestInfo?.matchRounds?.paperId || '');
+      const contestInfo = props.contestInfo || {};
+      const round = contestInfo.matchRounds || contestInfo.matchRound || {};
+      examId = String(round.programExamId || round.paperId || props.examId || '');
+      matchRoundId = String(round.id || props.matchRoundId || props.contestId || '');
+      openLevel = String(contestInfo.openLevel || props.openLevel || '');
     } catch {}
-    return { questionUrl, rankingUrl, examId };
+    return { questionUrl, rankingUrl, detailUrl, examId, matchRoundId, openLevel };
   });
 
-  let questionUrl = resolved.questionUrl || contest.questionUrl;
-  let rankingUrl = resolved.rankingUrl || contest.rankingUrl;
-  if (!new URL(rankingUrl).searchParams.get('examId') && resolved.examId) {
-    const question = new URL(questionUrl);
-    const ranking = new URL(rankingUrl);
-    question.searchParams.set('examId', resolved.examId);
-    ranking.searchParams.set('examId', resolved.examId);
-    questionUrl = question.href;
-    rankingUrl = ranking.href;
-  }
+  const id = extractContestId(resolved.rankingUrl || resolved.questionUrl || resolved.detailUrl || contest.detailUrl || contest.rankingUrl || contest.questionUrl)
+    || contest.id;
+  const detailParams = contestParamsFromUrl(resolved.detailUrl);
+  const rankingParams = contestParamsFromUrl(resolved.rankingUrl);
+  const questionParams = contestParamsFromUrl(resolved.questionUrl);
+  const fallbackParams = {
+    contestId: id,
+    teamCode: questionParams.teamCode || rankingParams.teamCode || detailParams.teamCode || contest.teamCode || teamCode,
+    matchRoundId: questionParams.matchRoundId || rankingParams.matchRoundId || detailParams.matchRoundId || resolved.matchRoundId || contest.matchRoundId || id,
+    examId: questionParams.examId || rankingParams.examId || detailParams.examId || resolved.examId || contest.examId || '',
+    openLevel: questionParams.openLevel || rankingParams.openLevel || detailParams.openLevel || resolved.openLevel || contest.openLevel || ''
+  };
+
+  const detailUrl = fillContestUrl(
+    resolved.detailUrl || contest.detailUrl || buildContestUrl({ ...fallbackParams, page: 'detail' }),
+    fallbackParams
+  );
+  const questionUrl = fillContestUrl(
+    resolved.questionUrl || buildContestUrl({ ...fallbackParams, page: 'question' }),
+    fallbackParams
+  );
+  const rankingUrl = fillContestUrl(
+    resolved.rankingUrl || buildContestUrl({ ...fallbackParams, page: 'ranking' }),
+    fallbackParams
+  );
 
   return {
     ...contest,
+    id,
+    matchRoundId: fallbackParams.matchRoundId,
+    openLevel: fallbackParams.openLevel,
+    detailUrl,
     questionUrl,
     rankingUrl,
-    examId: new URL(rankingUrl).searchParams.get('examId') || contest.examId || ''
+    examId: fallbackParams.examId
   };
+}
+
+function contestParamsFromUrl(value) {
+  try {
+    if (!value) return {};
+    const url = new URL(value);
+    return {
+      teamCode: url.searchParams.get('teamCode') || '',
+      matchRoundId: url.searchParams.get('matchRoundId') || '',
+      examId: url.searchParams.get('examId') || '',
+      openLevel: url.searchParams.get('openLevel') || ''
+    };
+  } catch {
+    return {};
+  }
+}
+
+function fillContestUrl(value, params) {
+  const url = new URL(value);
+  if (params.teamCode && !url.searchParams.get('teamCode')) url.searchParams.set('teamCode', params.teamCode);
+  if (params.matchRoundId && !url.searchParams.get('matchRoundId')) url.searchParams.set('matchRoundId', params.matchRoundId);
+  if (params.examId && !url.searchParams.get('examId')) url.searchParams.set('examId', params.examId);
+  if (params.openLevel && !url.searchParams.get('openLevel')) url.searchParams.set('openLevel', params.openLevel);
+  return url.href;
 }
 
 async function readNextPageProps(page) {
