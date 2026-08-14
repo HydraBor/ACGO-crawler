@@ -9,10 +9,16 @@
     "teamCode": "1000000000000000000"
   },
   "sessionName": "ACGO-代码证据包",
-  "dailySummaryPath": "今日总结.md",
+  "promptPath": "提示词.md",
+  "teacherUserIds": ["4741656"],
   "cdpUrl": "http://127.0.0.1:9222",
+  "browser": {
+    "autoLaunch": true,
+    "startupTimeoutMs": 20000,
+    "loginTimeoutMs": 600000,
+    "closeOnFinish": false
+  },
   "outputDirectory": "output",
-  "cleanOutput": true,
   "navigationTimeoutMs": 30000,
   "pageSettleDelayMs": 300,
   "actionDelayMs": 100,

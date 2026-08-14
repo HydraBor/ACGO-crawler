@@ -1,178 +1,82 @@
-# 部署文档
+# Windows 部署与使用
 
-## 环境要求
+## 推荐：便携 GUI 发行包
 
-- Windows 10/11
-- Node.js 20 或更高版本
-- Google Chrome
-- 一个有权限查看对应 ACGO 团队、作业、比赛和提交记录的账号
+目标平台为 Windows 10/11 x64。解压 `ACGO-Crawler-Windows-x64.zip` 后双击 `ACGO-Crawler-Launcher.exe`。
 
-## 首次部署
+发行目录包含：
 
-进入项目目录：
+- x64 WinForms 启动器；
+- 爬虫源码与生产依赖；
+- 必需的 `提示词.md`；
+- `runtime/node-runtime.zip` 及 SHA-256；
+- 使用说明。
 
-```powershell
-cd <project-directory>
-```
+启动器优先使用系统 Node.js 20+。没有合格 Node 时，会校验配套 SHA-256，并以防 Zip Slip 的方式解压便携 Node 运行时。
 
-安装依赖：
+## GUI 流程
+
+1. 输入团队链接（例如 `https://www.acgo.cn/team/<团队ID>`）或纯团队 ID。
+2. 选择作业、竞赛或同时采集，并填写相应 ID。
+3. 使用发行目录中的 `提示词.md`，或选择另一份非空完整提示词。
+4. 启动任务。程序先连 `cdpUrl`，失败后自动启动 Edge。
+5. 首次未登录时，在 Edge 完成 ACGO 登录；核心程序会自动检测登录成功并继续，不需要重启命令。
+6. 成功后打开 ZIP 所在目录。
+
+完整任务成功后会关闭本工具专用 profile 的 Edge，包括上次失败保留后本次重连的实例；连接到用户自己的外部 CDP 浏览器时默认只断开。未登录或采集失败时，程序自动启动的 Edge 默认保留，以便登录或排错。
+
+程序自动启动的专用 Edge 会禁用扩展，避免油猴等扩展的欢迎页或用户脚本干扰采集；这不会修改普通 Edge 的扩展配置。
+本程序自动启动的专用 Edge 复用它自己的唯一首页标签，并先确认登录再访问任务页；连接用户已有浏览器时才新建工作标签，不会导航或读取已经存在的油猴、个人网页或其他标签页。
+
+## 手工模式
+
+也可以在 GUI 中选择已有 `config.json`，或直接执行：
 
 ```powershell
 npm install
-```
-
-复制配置：
-
-```powershell
-Copy-Item config.example.json config.json
-Copy-Item 今日总结.example.md 今日总结.md
-```
-
-CMD 用户：
-
-```bat
-copy config.example.json config.json
-copy 今日总结.example.md 今日总结.md
-```
-
-## 启动 Chrome 登录态
-
-先关闭所有普通 Chrome 窗口，再运行：
-
-```powershell
-& "$env:ProgramFiles\Google\Chrome\Application\chrome.exe" `
-  --remote-debugging-port=9222 `
-  --user-data-dir="$env:LOCALAPPDATA\ACGO-Crawler-Chrome"
-```
-
-如果 Chrome 在 `Program Files (x86)`：
-
-```powershell
-& "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe" `
-  --remote-debugging-port=9222 `
-  --user-data-dir="$env:LOCALAPPDATA\ACGO-Crawler-Chrome"
-```
-
-在打开的 Chrome 中登录 ACGO。这个浏览器配置目录会保留登录态，后续通常不需要重复登录。
-
-## 配置
-
-编辑 `config.json`：
-
-```json
-{
-  "targets": ["homework", "contest"],
-  "homework": {
-    "id": "10001",
-    "teamCode": "1000000000000000000"
-  },
-  "contest": {
-    "id": "20001",
-    "teamCode": "1000000000000000000"
-  },
-  "sessionName": "ACGO-代码证据包",
-  "dailySummaryPath": "今日总结.md",
-  "cdpUrl": "http://127.0.0.1:9222",
-  "outputDirectory": "output",
-  "cleanOutput": true,
-  "navigationTimeoutMs": 30000,
-  "pageSettleDelayMs": 300,
-  "actionDelayMs": 100,
-  "questionApiConcurrency": 4,
-  "submissionApiConcurrency": 4,
-  "submissionDetailConcurrency": 3,
-  "apiRetryCount": 3,
-  "maxRankingPages": 100,
-  "saveDebugFiles": false
-}
-```
-
-常用调整：
-
-- 只爬作业：`"targets": ["homework"]`
-- 只爬比赛：`"targets": ["contest"]`
-- 每日总结文件：`"dailySummaryPath": "今日总结.md"`
-- 保留旧输出：`"cleanOutput": false`
-- 保存调试页面：`"saveDebugFiles": true`
-- 限制最多分页：`"maxRankingPages": 100`
-- 提高读取速度：适当调高 `questionApiConcurrency`、`submissionApiConcurrency`、`submissionDetailConcurrency`
-- 遇到接口临时失败：适当降低并发，或调高 `actionDelayMs`
-- 比赛入口：默认用 `contest.id` 和 `contest.teamCode` 打开比赛详情页，其余参数自动识别
-- 比赛高级参数：`contest.matchRoundId`、`contest.examId`、`contest.openLevel` 通常不用填写
-
-## 每日使用流程
-
-1. 更新项目根目录的 `今日总结.md`。
-2. 修改 `config.json` 中的作业号、比赛号、团队号。
-3. 运行诊断：
-
-```powershell
 npm run inspect
-```
-
-4. 确认诊断正常后导出：
-
-```powershell
 npm start
 ```
 
-5. 打开 `output/<sessionName>/` 查看证据包。
+`提示词.md` 是必需文件。`npm run inspect` 只做入口诊断，不能替代 `npm start` 对所有提交接口的完整测试。
 
-## 诊断重点
+## 输出与完成条件
 
-- Chrome 是否已登录。
-- 比赛是否成功识别 `examId`。
-- 作业题目链接是否识别。
-- 比赛排行榜 `rankingRows` 是否等于 `rankingTotal`。
-- `debug/诊断报告.json` 中是否有关键接口响应。
+成功标志必须同时满足：
 
-## 给 AI 的材料
+- `<outputDirectory>/<sessionName>/raw/summary.json` 存在且可解析（仅供本地核验，不进入 AI ZIP）；
+- ZIP 成功生成；
+- 题目数、学生数、学生文件数和提交代码数通过完整性检查；
+- 配置的教师 ID 不出现在正式输出；
+- 没有提交详情接口失败或空代码；
+- 控制台出现 `ZIP 已生成：<绝对路径>`。
 
-- `prompts/家长反馈生成提示词.md`
-- `今日总结.md`
-- `作业题目.md`
-- `比赛题目.md`
-- 某个学生目录下的 `课堂练习.md`
-- 同一个学生目录下的 `今日比赛.md`
+程序通过暂存目录和回滚机制发布结果。失败时不会用半成品覆盖上一次完整输出；成功时始终完整替换同名旧目录，未知旧文件也不会残留。
 
-## 更新版本
+## 常见问题
 
-更新代码后运行：
+### Edge 已打开但提示未登录
+
+请在程序弹出的独立 Edge 中登录 ACGO，而不是普通 Edge 窗口。程序默认等待 10 分钟并自动检测登录成功；该专用配置目录会保留登录态。
+
+### 自动启动失败
+
+程序按 Edge 的 Program Files、Program Files (x86)、LocalAppData 路径探测，再回退 Chrome。可在配置的 `browser.executablePath` 指定浏览器完整路径，并确认本机 CDP 端口未被其他程序占用。
+
+### 排行榜或代码不完整
+
+完整任务现在会严格失败，而不是静默导出。确认账号有查看团队、作业、比赛和学生代码的权限；必要时临时设置 `saveDebugFiles=true`，但调试 HTML/截图含敏感数据，应排错后删除。
+
+### AI 不能读取 ZIP
+
+ZIP 仍是完整交付物。先解压，再上传根目录 `提示词.md`、题面和 `students/` 中各学生 Markdown 文件。
+
+## 更新与重建
 
 ```powershell
 npm install
 npm test
+npm run build:launcher
 ```
 
-如果依赖没有变化，`npm install` 通常会很快完成。
-
-## 常见问题
-
-### 无法连接 Chrome
-
-确认 Chrome 是用 `--remote-debugging-port=9222` 启动的，并且 `config.json` 中 `cdpUrl` 是 `http://127.0.0.1:9222`。
-
-### 提示未登录
-
-在远程调试 Chrome 里打开 ACGO 并登录，再重新运行。
-
-### 比赛缺少 `examId`
-
-保留 `contest.id` 和 `teamCode`，运行 `npm run inspect`。脚本会先访问比赛详情页，并尽量从页面里自动补出 `examId`。如果仍失败，可以把排行榜链接中的 `examId` 手动填入 `contest.examId`。
-
-### 排行榜人数不完整
-
-检查控制台是否有 `已读取 x/y 名学生` 警告。必要时提高：
-
-```json
-{
-  "maxRankingPages": 200
-}
-```
-
-如果 ACGO 临时改版，打开 `saveDebugFiles` 后重新运行诊断。
-
-### 代码提交为空
-
-确认当前账号有查看该学生提交详情的权限。若排行榜显示有提交但文件为空，请开启 `saveDebugFiles` 并保留 `raw/summary.json` 供排查。
-
+完整构建从 Node.js 官方发布站下载固定 Windows x64 便携包，并核对官方 `SHASUMS256.txt`。构建失败时不要交付旧 `dist`。

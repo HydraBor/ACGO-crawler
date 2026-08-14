@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import { dedupeSubmissions } from '../src/extract.mjs';
 import { cleanupMarkdown, formatProblemHeading, htmlToMarkdown, languageFence, normalizeProblemMarkdown } from '../src/markdown.mjs';
 import { buildQuestionDataUrl, problemFromNextData } from '../src/problem-data.mjs';
-import { renderBatchInstructions, renderFeedbackPrompt } from '../src/feedback.mjs';
 
 test('重复提交按提交 ID 去重', () => {
   const result = dedupeSubmissions([
@@ -139,18 +138,5 @@ test('正确构造题目 Next Data 地址', () => {
   assert.equal(url.pathname, '/_next/data/build-1/problemset/info/109981.json');
   assert.equal(url.searchParams.get('questionId'), '109981');
   assert.equal(url.searchParams.get('homeworkId'), '22113');
-});
-
-test('反馈提示词面向当前代码证据包结构', () => {
-  const prompt = renderFeedbackPrompt({ dailySummaryMarkdown: '【今日学习目标】\n（1）掌握：变量和输入' });
-  const instructions = renderBatchInstructions();
-  assert.match(prompt, /今日总结/);
-  assert.match(prompt, /变量和输入/);
-  assert.match(prompt, /课堂练习\.md/);
-  assert.match(prompt, /今日比赛\.md/);
-  assert.match(instructions, /今日总结\.md/);
-  assert.match(instructions, /作业题目\.md/);
-  assert.match(instructions, /比赛题目\.md/);
-  assert.doesNotMatch(`${prompt}\n${instructions}`, /只输出代码/);
 });
 

@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import { htmlToMarkdown, normalizeProblemMarkdown } from './markdown.mjs';
 
-export function sha1(value) {
+function sha1(value) {
   return crypto.createHash('sha1').update(String(value)).digest('hex');
 }
 

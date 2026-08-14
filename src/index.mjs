@@ -1,7 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import process from 'node:process';
-import { chromium } from 'playwright-core';
 import sanitizeFilename from 'sanitize-filename';
 import {
   dedupeSubmissions,
@@ -9,95 +8,170 @@ import {
 } from './extract.mjs';
 import { escapeTable, formatProblemHeading, languageFence } from './markdown.mjs';
 import { buildQuestionDataUrl, problemFromNextData } from './problem-data.mjs';
-import { renderBatchInstructions, renderFeedbackPrompt } from './feedback.mjs';
+import { acquireBrowser, createDedicatedWorkPage } from './browser.mjs';
+import { createTeacherUserIdMatcher, rebaseCompetitionRanks } from './filters.mjs';
+import { buildContestUrl, loadConfigFile, normalizeConfig } from './config.mjs';
+import { createOutputTransaction } from './output-transaction.mjs';
+import { buildEvidencePackage } from './package.mjs';
+import { loadPrompt } from './prompt.mjs';
+import { waitForAcgoLogin } from './login.mjs';
+import {
+  collectPaginatedRecords,
+  createMultiPageResponseStore,
+  requireSubmissionCode,
+  requestAcgoApiWithRetry,
+  resolveContestQuestionOrder,
+  throwIfCollectedFailures,
+  uniqueByFirst
+} from './reliability.mjs';
 
-const args = parseArgs(process.argv.slice(2));
-const configPath = path.resolve(args.config || 'config.json');
-const configDirectory = path.dirname(configPath);
-const config = normalizeConfig(await loadConfig(configPath));
-const homeworkId = config.homework?.id || '';
-const teamCode = config.homework?.teamCode || config.contest?.teamCode || '';
-const contestConfig = config.contest;
-const contestId = contestConfig?.id || '';
-const packageSlug = config.packageName || config.sessionName || (
-  [homeworkId ? `homework-${homeworkId}` : '', contestId ? `contest-${contestId}` : ''].filter(Boolean).join('-') || 'acgo-crawl'
-);
-const rootDirectory = path.resolve(config.outputDirectory || 'output', safeFilename(packageSlug));
-const debugDirectory = path.join(rootDirectory, 'debug');
-const rawDirectory = path.join(rootDirectory, 'raw');
-const studentsDirectory = path.join(rootDirectory, 'students');
-const promptsDirectory = path.join(rootDirectory, 'prompts');
-const dailySummaryPath = resolveConfigPath(config.dailySummaryPath || config.dailySummaryFile || '今日总结.md');
+let args = {};
+let configPath = '';
+let configDirectory = '';
+let config = {};
+let homeworkId = '';
+let teamCode = '';
+let contestConfig = null;
+let contestId = '';
+let packageSlug = '';
+let finalRootDirectory = '';
+let rootDirectory = '';
+let debugDirectory = '';
+let rawDirectory = '';
+let studentsDirectory = '';
+let teacherUserMatcher = createTeacherUserIdMatcher([]);
+let promptSource = null;
 
-if (config.cleanOutput !== false) {
-  await cleanGeneratedOutput();
-}
+await main();
 
-await Promise.all([
-  rootDirectory,
-  debugDirectory,
-  rawDirectory,
-  studentsDirectory,
-  promptsDirectory
-].map(directory => fs.mkdir(directory, { recursive: true })));
+async function main() {
+  let browserSession;
+  let responseStore;
+  let requestStore;
+  let outputTransaction;
+  let page;
+  let runSucceeded = false;
 
-const dailySummaryMarkdown = await loadDailySummary(dailySummaryPath);
-
-console.log(`正在连接 Chrome：${config.cdpUrl}`);
-let browser;
-try {
-  browser = await chromium.connectOverCDP(config.cdpUrl || 'http://127.0.0.1:9222');
-} catch (error) {
-  fail(`无法连接 Chrome。请按 README 的命令用 --remote-debugging-port=9222 启动 Chrome。\n${error.message}`);
-}
-
-const context = browser.contexts()[0];
-if (!context) fail('Chrome 中没有可用的浏览器上下文。');
-context.setDefaultTimeout(config.navigationTimeoutMs || 30000);
-context.setDefaultNavigationTimeout(config.navigationTimeoutMs || 30000);
-
-const page = context.pages()[0] || await context.newPage();
-const responseStore = createResponseStore(page);
-const requestStore = createRequestStore(context);
-
-try {
-  const api = createAcgoApi(context, requestStore);
-  if (args.inspectOnly) {
-    await inspectConfiguredPages(page, api, responseStore);
-    process.exitCode = 0;
-  } else {
-    const classroomDataset = config.homework ? await collectHomeworkDataset(page, api) : null;
-
-    let contestDataset = null;
-    if (contestConfig) {
-      const contestPage = await context.newPage();
-      try {
-        contestDataset = await collectContestDataset(contestPage, api, contestConfig);
-      } finally {
-        await contestPage.close().catch(() => {});
-      }
-    }
-
-    await writeCodeEvidenceFiles({ classroomDataset, contestDataset, dailySummaryMarkdown });
-
-    const summary = { homeworkId, dailySummary: dailySummaryMarkdown, classroom: classroomDataset, contest: contestDataset };
-    await writeJson(path.join(rawDirectory, 'summary.json'), summary);
-    if (config.saveDebugFiles) {
-      await writeJson(path.join(debugDirectory, '响应结构.json'), responseStore.shapes());
-    }
-    console.log(`导出完成：${rootDirectory}`);
-  }
-} catch (error) {
-  console.error(`\n导出失败：${error.stack || error.message}`);
   try {
-    await saveDebugPage(page, '发生错误时页面');
-    await writeJson(path.join(debugDirectory, '响应结构.json'), responseStore.shapes());
-  } catch {}
-  process.exitCode = 1;
-} finally {
-  responseStore.dispose();
-  requestStore.dispose();
-  await browser.close().catch(() => {});
+    args = parseArgs(process.argv.slice(2));
+    configPath = path.resolve(args.config || 'config.json');
+    configDirectory = path.dirname(configPath);
+    config = normalizeConfig(await loadConfigFile(configPath));
+    homeworkId = config.homework?.id || '';
+    teamCode = config.homework?.teamCode || config.contest?.teamCode || '';
+    contestConfig = config.contest;
+    contestId = contestConfig?.id || '';
+    packageSlug = config.sessionName || (
+      [homeworkId ? `homework-${homeworkId}` : '', contestId ? `contest-${contestId}` : ''].filter(Boolean).join('-') || 'acgo-crawl'
+    );
+    finalRootDirectory = path.resolve(config.outputDirectory || 'output', safeFilename(packageSlug));
+    setOutputRoot(finalRootDirectory);
+    teacherUserMatcher = createTeacherUserIdMatcher(config.teacherUserIds);
+    promptSource = await loadPrompt({ promptPath: config.promptPath, configDirectory });
+
+    console.log(`正在连接浏览器：${config.cdpUrl}`);
+    browserSession = await acquireBrowser(config);
+    const { context } = browserSession;
+    context.setDefaultTimeout(config.navigationTimeoutMs || 30000);
+    context.setDefaultNavigationTimeout(config.navigationTimeoutMs || 30000);
+    page = await createDedicatedWorkPage(context, {
+      reuseExisting: browserSession.managedProfile,
+      closeOtherPages: browserSession.managedProfile
+    });
+    // 先在唯一的任务标签中确认登录，再访问受保护的作业/比赛页面。
+    // 这样自启动 Edge 不会同时留下首页和 403 两个窗口；外接浏览器仍只使用新建标签。
+    await gotoStable(page, 'https://www.acgo.cn/');
+    await ensureLoggedIn(page, 'https://www.acgo.cn/');
+    responseStore = createMultiPageResponseStore(context);
+    requestStore = createRequestStore(context);
+
+    outputTransaction = await createOutputTransaction(finalRootDirectory, {
+      inspectOnly: Boolean(args.inspectOnly)
+    });
+    setOutputRoot(outputTransaction.stagingDirectory);
+    await Promise.all([
+      rootDirectory,
+      rawDirectory,
+      studentsDirectory
+    ].map(directory => fs.mkdir(directory, { recursive: true })));
+    if (args.inspectOnly || config.saveDebugFiles) {
+      await fs.mkdir(debugDirectory, { recursive: true });
+    } else {
+      await fs.rm(debugDirectory, { recursive: true, force: true });
+    }
+
+    const api = createAcgoApi(context, requestStore);
+    if (args.inspectOnly) {
+      await inspectConfiguredPages(page, api, responseStore);
+    } else {
+      const classroomDataset = config.homework ? await collectHomeworkDataset(page, api) : null;
+
+      let contestDataset = null;
+      if (contestConfig) {
+        contestDataset = await collectContestDataset(page, api, contestConfig);
+      }
+
+      assertExcludedTeachersAbsent(classroomDataset, contestDataset);
+      const studentMaterialPaths = await writeCodeEvidenceFiles({ classroomDataset, contestDataset, prompt: promptSource.markdown });
+      const summary = {
+        homeworkId,
+        prompt: promptSource.metadata,
+        filters: {
+          homeworkExcludedTeacherCount: classroomDataset?.excludedTeacherCount || 0,
+          contestExcludedTeacherCount: contestDataset?.excludedTeacherCount || 0
+        },
+        classroom: classroomDataset,
+        contest: contestDataset
+      };
+      await writeJson(path.join(rawDirectory, 'summary.json'), summary);
+      if (config.saveDebugFiles) {
+        await writeJson(path.join(debugDirectory, '响应结构.json'), await responseStore.shapes());
+      }
+      const finalZipPath = path.join(path.dirname(finalRootDirectory), `${safeFilename(packageSlug)}.zip`);
+      const stagedZipPath = outputTransaction.createArtifactPath(finalZipPath);
+      await buildEvidencePackage(rootDirectory, {
+        archiveName: safeFilename(packageSlug),
+        zipPath: stagedZipPath,
+        includeHomework: Boolean(classroomDataset),
+        includeContest: Boolean(contestDataset),
+        studentFiles: studentMaterialPaths
+      });
+    }
+
+    await outputTransaction.commit();
+    runSucceeded = true;
+    setOutputRoot(finalRootDirectory);
+    if (args.inspectOnly) {
+      console.log(`诊断完成：${debugDirectory}`);
+    } else {
+      console.log(`导出完成：${finalRootDirectory}`);
+      console.log(`ZIP 已生成：${path.join(path.dirname(finalRootDirectory), `${safeFilename(packageSlug)}.zip`)}`);
+    }
+  } catch (error) {
+    console.error(`\n${args.inspectOnly ? '诊断' : '导出'}失败：${error.stack || error.message}`);
+    if (page && outputTransaction) {
+      try {
+        await saveDebugPage(page, '发生错误时页面');
+        if (responseStore) await writeJson(path.join(debugDirectory, '响应结构.json'), await responseStore.shapes());
+      } catch {}
+    }
+    process.exitCode = 1;
+  } finally {
+    if (responseStore) await responseStore.dispose().catch(() => {});
+    requestStore?.dispose();
+    if (outputTransaction && !runSucceeded) await outputTransaction.rollback().catch(() => {});
+    if (runSucceeded && page && !page.isClosed()) await page.close().catch(() => {});
+    if (browserSession) {
+      await browserSession.dispose({ successful: runSucceeded, inspectOnly: Boolean(args.inspectOnly) }).catch(() => {});
+    }
+  }
+}
+
+function setOutputRoot(directory) {
+  rootDirectory = path.resolve(directory);
+  debugDirectory = path.join(rootDirectory, 'debug');
+  rawDirectory = path.join(rootDirectory, 'raw');
+  studentsDirectory = path.join(rootDirectory, 'students');
 }
 
 function parseArgs(values) {
@@ -107,134 +181,6 @@ function parseArgs(values) {
     else if (values[i] === '--inspect-only') result.inspectOnly = true;
   }
   return result;
-}
-
-function resolveConfigPath(value) {
-  return path.isAbsolute(String(value || ''))
-    ? String(value)
-    : path.resolve(configDirectory, String(value || ''));
-}
-
-async function loadConfig(filename) {
-  try {
-    return JSON.parse(await fs.readFile(filename, 'utf8'));
-  } catch (error) {
-    fail(`无法读取 ${filename}：${error.message}\n请先把 config.example.json 复制为 config.json。`);
-  }
-}
-
-async function loadDailySummary(filename) {
-  try {
-    return (await fs.readFile(filename, 'utf8')).trim();
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-    const template = defaultDailySummaryTemplate();
-    await fs.writeFile(filename, `${template}\n`, 'utf8');
-    console.warn(`未找到今日总结，已创建模板：${filename}`);
-    return template.trim();
-  }
-}
-
-function defaultDailySummaryTemplate() {
-  return `## 今日总结
-
-Day 01 集训总结
-
-【今日学习目标】
-（1）了解：
-（2）掌握：
-（3）掌握：
-
-【今日重难点辨析】
-（1）
-（2）
-（3）
-
-【今日易错点】
-（1）
-（2）
-（3）
-
-【累计知识点数量】
-
-【累计做题量】
-
-【备注】
-每位学员学习反馈卡会由班主任发放至各位家长微信，请注意查收，若有疑问可及时联系班主任。`;
-}
-
-function normalizeConfig(value) {
-  const normalized = { ...value };
-  normalized.homework = buildHomeworkConfig(value);
-  normalized.contest = buildContestConfig(value);
-
-  if (!normalized.homework && !normalized.contest) {
-    fail('配置中没有可爬取目标。请在 config.json 中提供 homework、contest，或设置 targets。');
-  }
-  return normalized;
-}
-
-function buildHomeworkConfig(value) {
-  const source = value.homework || {};
-  const id = String(source.id || '');
-  const currentTeamCode = String(source.teamCode || '');
-  const groupId = source.groupId || '';
-  if (!targetEnabled(value, 'homework', Boolean(id || currentTeamCode || source.enabled))) return null;
-  if (!id || !currentTeamCode) fail('作业配置不完整：请提供 homework.id 和 homework.teamCode。');
-
-  return {
-    id,
-    teamCode: currentTeamCode,
-    groupId,
-    questionUrl: buildHomeworkUrl({ homeworkId: id, teamCode: currentTeamCode, tab: 'question', groupId }),
-    rankingUrl: buildHomeworkUrl({ homeworkId: id, teamCode: currentTeamCode, tab: 'ranking', groupId })
-  };
-}
-
-function buildContestConfig(value) {
-  const source = value.contest || {};
-  const id = String(source.id || '');
-  const matchRoundId = String(source.matchRoundId || id || '');
-  const examId = String(source.examId || '');
-  const openLevel = String(source.openLevel || '');
-  const currentTeamCode = String(source.teamCode || '');
-  if (!targetEnabled(value, 'contest', Boolean(id || currentTeamCode || source.enabled))) return null;
-  if (!id || !currentTeamCode) fail('比赛配置不完整：请提供 contest.id 和 contest.teamCode。');
-
-  const base = { contestId: id, matchRoundId, examId, openLevel, teamCode: currentTeamCode };
-  return {
-    id,
-    matchRoundId,
-    examId,
-    openLevel,
-    teamCode: currentTeamCode,
-    detailUrl: source.detailUrl || buildContestUrl({ contestId: id, teamCode: currentTeamCode, page: 'detail' }),
-    questionUrl: buildContestUrl({ ...base, page: 'question' }),
-    rankingUrl: buildContestUrl({ ...base, page: 'ranking' }),
-    label: source.label || '今日比赛'
-  };
-}
-
-function targetEnabled(value, target, hasConfig) {
-  if (Array.isArray(value.targets)) return value.targets.includes(target);
-  return hasConfig;
-}
-
-function buildHomeworkUrl({ homeworkId, teamCode, tab, groupId }) {
-  const url = new URL(`https://www.acgo.cn/homework/${homeworkId}`);
-  url.searchParams.set('teamCode', teamCode);
-  if (groupId) url.searchParams.set('groupId', groupId);
-  url.searchParams.set('tab', tab);
-  return url.href;
-}
-
-function buildContestUrl({ page, contestId, matchRoundId, examId, openLevel, teamCode }) {
-  const url = new URL(`https://www.acgo.cn/contest/${page}/${contestId}`);
-  if (matchRoundId) url.searchParams.set('matchRoundId', matchRoundId);
-  if (examId) url.searchParams.set('examId', examId);
-  if (openLevel) url.searchParams.set('openLevel', openLevel);
-  if (teamCode) url.searchParams.set('teamCode', teamCode);
-  return url.href;
 }
 
 function extractContestId(url) {
@@ -248,31 +194,6 @@ function extractContestId(url) {
   } catch {
     return '';
   }
-}
-
-function fail(message) {
-  console.error(message);
-  process.exit(1);
-}
-
-async function cleanGeneratedOutput() {
-  const targets = [
-    studentsDirectory,
-    promptsDirectory,
-    rawDirectory,
-    debugDirectory,
-    path.join(rootDirectory, 'README.md'),
-    path.join(rootDirectory, '今日总结.md'),
-    path.join(rootDirectory, '作业题面.md'),
-    path.join(rootDirectory, '作业题目.md'),
-    path.join(rootDirectory, '比赛题目.md'),
-    path.join(rootDirectory, '完成情况.md'),
-    path.join(rootDirectory, '作业完成情况.md'),
-    path.join(rootDirectory, '比赛排行榜.md'),
-    path.join(rootDirectory, '课堂练习'),
-    path.join(rootDirectory, '今日比赛')
-  ];
-  await Promise.all(targets.map(target => fs.rm(target, { recursive: true, force: true })));
 }
 
 async function gotoStable(page, url) {
@@ -290,12 +211,13 @@ async function gotoStable(page, url) {
   await page.waitForTimeout(pageSettleDelayMs());
 }
 
-async function ensureLoggedIn(page) {
-  const url = page.url();
-  const body = await page.locator('body').innerText().catch(() => '');
-  if (/login|signin/i.test(url) || (/登录/.test(body) && !/作业|题目|排行榜/.test(body))) {
-    throw new Error('当前远程调试 Chrome 尚未登录 ACGO。请在该 Chrome 窗口登录后重新运行。');
-  }
+async function ensureLoggedIn(page, targetUrl = '') {
+  await waitForAcgoLogin(page, {
+    timeoutMs: config.browser.loginTimeoutMs ?? 10 * 60 * 1000,
+    pollIntervalMs: config.browser?.loginPollIntervalMs ?? 1000,
+    prepareLogin: () => gotoStable(page, 'https://www.acgo.cn/'),
+    resume: targetUrl ? () => gotoStable(page, targetUrl) : undefined
+  });
 }
 
 async function collectQuestionLinks(page, options = {}) {
@@ -317,7 +239,7 @@ async function collectQuestionLinks(page, options = {}) {
           && !/\/contest\/(?:question|ranking|detail)\//i.test(pathname);
       });
   });
-  const unique = uniqueBy(links, item => item.url);
+  const unique = uniqueByFirst(links, item => item.url);
   if (!unique.length) {
     if (options.allowEmpty) return [];
     await saveDebugPage(page, '未识别到题目链接');
@@ -331,7 +253,7 @@ async function inspectConfiguredPages(page, api, responseStore) {
   if (config.homework) {
     console.log('诊断：读取作业题目入口…');
     await gotoStable(page, config.homework.questionUrl);
-    await ensureLoggedIn(page);
+    await ensureLoggedIn(page, config.homework.questionUrl);
     await saveDebugPage(page, 'inspect-作业题目入口');
     const questionLinks = await collectQuestionLinks(page).catch(error => ({ error: error.message }));
 
@@ -350,7 +272,7 @@ async function inspectConfiguredPages(page, api, responseStore) {
   if (contestConfig) {
     console.log('诊断：读取比赛入口…');
     await gotoStable(page, contestConfig.detailUrl || contestConfig.questionUrl);
-    await ensureLoggedIn(page);
+    await ensureLoggedIn(page, contestConfig.detailUrl || contestConfig.questionUrl);
     const resolvedContest = await resolveContestConfigFromPage(page, contestConfig);
 
     console.log('诊断：读取比赛题目入口…');
@@ -371,7 +293,7 @@ async function inspectConfiguredPages(page, api, responseStore) {
     };
   }
 
-  report.responseShapes = responseStore.shapes();
+  report.responseShapes = await responseStore.shapes();
   await writeJson(path.join(debugDirectory, '诊断报告.json'), report);
   console.log(`诊断完成：${debugDirectory}`);
 }
@@ -379,7 +301,7 @@ async function inspectConfiguredPages(page, api, responseStore) {
 async function collectHomeworkDataset(page, api) {
   console.log('读取作业题目列表…');
   await gotoStable(page, config.homework.questionUrl);
-  await ensureLoggedIn(page);
+  await ensureLoggedIn(page, config.homework.questionUrl);
   await saveDebugPage(page, '01-作业题目入口');
   const questionLinks = await collectQuestionLinks(page);
   console.log(`识别到 ${questionLinks.length} 个题目链接。`);
@@ -399,16 +321,21 @@ async function collectHomeworkDataset(page, api) {
   for (const student of ranking.students) students.set(student.key, { ...student, submissions: [] });
 
   const homeworkSubmissionTasks = ranking.detailEntries;
+  const submissionFailures = [];
   await mapWithConcurrency(homeworkSubmissionTasks, submissionApiConcurrency(), async (entry, index) => {
     console.log(`读取作业提交 ${index + 1}/${ranking.detailEntries.length}：${entry.username} / ${entry.questionTitle}`);
     let submissions = [];
+    let submissionError = null;
     try {
       submissions = await collectSubmissionAttemptsFromApi(api, entry);
     } catch (error) {
       console.warn(`  作业提交接口读取失败：${error.message}`);
+      submissionError = error;
     }
-    if (!submissions.length) {
+    if (!submissions.length && (submissionError || entry.expectedSubmissions)) {
       await saveDebugPage(page, `未读取到提交-${entry.username}-${entry.questionTitle}`);
+      const message = submissionError?.message || '排行榜显示已提交，但提交接口未返回代码';
+      submissionFailures.push(new Error(`${entry.username} / ${entry.questionTitle}：${message}`, { cause: submissionError || undefined }));
     }
     const student = students.get(entry.studentKey) || {
       key: entry.studentKey,
@@ -425,6 +352,8 @@ async function collectHomeworkDataset(page, api) {
     students.set(entry.studentKey, student);
     await delay(requestDelayMs());
   });
+
+  throwIfCollectedFailures(submissionFailures, homeworkSubmissionTasks.length, '作业提交任务');
 
   for (const student of students.values()) {
     student.submissions = dedupeSubmissions(student.submissions);
@@ -444,7 +373,8 @@ async function collectHomeworkDataset(page, api) {
     url: config.homework.questionUrl,
     problems: normalizeProblemsForFeedback(problems),
     ranking,
-    students: [...students.values()]
+    students: [...students.values()],
+    excludedTeacherCount: ranking.excludedTeacherCount || 0
   };
 }
 
@@ -563,12 +493,21 @@ async function collectRankingFromApi(api, problems) {
     teamCode
   };
 
-  const firstPage = await api.get(endpoint, { ...commonParams, page: '1', pageSize: String(pageSize) });
-  const records = [...(firstPage?.records || [])];
-  const pages = Number(firstPage?.pages || Math.ceil(Number(firstPage?.total || records.length) / pageSize) || 1);
-  for (let pageNumber = 2; pageNumber <= pages; pageNumber++) {
-    const nextPage = await api.get(endpoint, { ...commonParams, page: String(pageNumber), pageSize: String(pageSize) });
-    records.push(...(nextPage?.records || []));
+  const rankingPages = await collectPaginatedRecords({
+    maxPages: config.maxRankingPages || 100,
+    label: '作业排行榜',
+    keyOf: homeworkRankingRecordKey,
+    loadPage: pageNumber => api.get(endpoint, {
+      ...commonParams,
+      page: String(pageNumber),
+      pageSize: String(pageSize)
+    }),
+    recordsFromPage: pageData => pageData?.records,
+    totalFromPage: pageData => pageData?.total
+  });
+  const records = rankingPages.records;
+  if (rankingPages.pagesRead > 1) {
+    console.log(`作业排行榜分页读取完成：${records.length}/${rankingPages.total || records.length} 名，${rankingPages.pagesRead} 页。`);
   }
 
   const scoreList = await api.get(`/acgoPms/api/team/${teamCode}/homework/getQuestionScore/${homeworkId}`);
@@ -601,13 +540,16 @@ async function collectRankingFromApi(api, problems) {
   const students = [];
   const detailEntries = [];
 
-  for (const record of records) {
+  const includedRecords = records.filter(record => !teacherUserMatcher.excludes(record.userInfo?.userId));
+  const displayRanks = rebaseCompetitionRanks(includedRecords, record => record.order);
+  for (let recordIndex = 0; recordIndex < includedRecords.length; recordIndex++) {
+    const record = includedRecords[recordIndex];
     const userId = String(record.userInfo?.userId || '');
     const username = cleanName(record.userInfo?.teamVo?.teamUserName || record.userInfo?.nickName || `用户${userId}`);
     const key = `${userId}:${username}`;
     const answerByQuestionId = new Map((record.homeworkAnswerList || []).map(answer => [String(answer.questionId), answer]));
     const cells = {
-      名次: String(record.order ?? ''),
+      名次: String(displayRanks[recordIndex]),
       用户名: username,
       总分: formatScoreAndTime(record.totalScore, record.totalCpuTimeStr)
     };
@@ -618,24 +560,29 @@ async function collectRankingFromApi(api, problems) {
       cells[header] = answer && answer.score !== null && answer.score !== undefined
         ? formatScoreAndTime(answer.score, answer.cpuTimeStr)
         : '';
-      if (!answer?.questionId || answer.score === null || answer.score === undefined) continue;
       detailEntries.push({
         studentKey: key,
         username,
         userId,
-        questionId: String(answer.questionId),
+        questionId: question.questionId,
         questionIndex: question.index,
         questionTitle: formatProblemHeading(question.index, question.title),
-        questionKey: String(answer.questionId),
+        questionKey: question.questionId,
         fullScore: question.fullScore,
-        rankingScore: Number(answer.score),
-        rankingRecordId: answer.recordId
+        rankingScore: answer?.score === null || answer?.score === undefined ? null : Number(answer.score),
+        rankingRecordId: answer?.recordId,
+        expectedSubmissions: Boolean(answer?.questionId && answer.score !== null && answer.score !== undefined)
       });
     }
     students.push({ key, username, userId, cells });
   }
 
-  return { headers, students, detailEntries };
+  return {
+    headers,
+    students,
+    detailEntries,
+    excludedTeacherCount: records.length - includedRecords.length
+  };
 }
 
 async function collectSubmissionAttemptsFromApi(api, entry) {
@@ -644,7 +591,7 @@ async function collectSubmissionAttemptsFromApi(api, entry) {
   const records = await api.post(listEndpoint, {
     questionId: Number(entry.questionId),
     homeworkId: Number(homeworkId),
-    userId: Number(entry.userId),
+    userId: String(entry.userId),
     teamCode
   });
   const sortedRecords = [...(records || [])].sort((left, right) => {
@@ -658,8 +605,8 @@ async function collectSubmissionAttemptsFromApi(api, entry) {
       id: Number(record.id),
       homeworkId: Number(homeworkId)
     });
-    const code = Array.isArray(detail?.answer) ? String(detail.answer[0] || '') : String(detail?.answer || '');
-    if (!code) return null;
+    const rawCode = Array.isArray(detail?.answer) ? detail.answer[0] : detail?.answer;
+    const code = requireSubmissionCode(rawCode, record.id);
     return {
       submissionId: String(record.id),
       questionTitle: entry.questionTitle,
@@ -680,12 +627,12 @@ async function collectContestDataset(page, api, contest) {
 
   console.log('读取今日比赛入口…');
   await gotoStable(page, runtimeContest.detailUrl || runtimeContest.questionUrl);
-  await ensureLoggedIn(page);
+  await ensureLoggedIn(page, runtimeContest.detailUrl || runtimeContest.questionUrl);
   runtimeContest = await resolveContestConfigFromPage(page, runtimeContest);
 
   console.log('读取今日比赛题目列表…');
   await gotoStable(page, runtimeContest.questionUrl);
-  await ensureLoggedIn(page);
+  await ensureLoggedIn(page, runtimeContest.questionUrl);
   runtimeContest = await resolveContestConfigFromPage(page, runtimeContest);
   const contestTeamCode = new URL(runtimeContest.questionUrl).searchParams.get('teamCode') || runtimeContest.teamCode || teamCode;
   const id = extractContestId(runtimeContest.questionUrl) || runtimeContest.id;
@@ -725,8 +672,9 @@ async function collectContestDataset(page, api, contest) {
     questionList
   });
 
-  if (contestDataset.ranking.total && contestDataset.ranking.total > contestDataset.students.length) {
-    console.warn(`比赛排行榜页面只包含 ${contestDataset.students.length}/${contestDataset.ranking.total} 名学生；如有分页，请后续补充比赛排行榜接口或页面分页采集。`);
+  const expectedStudentCount = contestDataset.ranking.sourceTotal - contestDataset.excludedTeacherCount;
+  if (expectedStudentCount !== contestDataset.students.length) {
+    throw new Error(`比赛排行榜完整性校验失败：过滤教师后应有 ${expectedStudentCount} 名学生，实际读取 ${contestDataset.students.length} 名。`);
   }
 
   await collectContestSubmissions(api, contestDataset, contestTeamCode, runtimeContest.rankingUrl);
@@ -736,42 +684,37 @@ async function collectContestDataset(page, api, contest) {
 }
 
 async function collectContestRankingPages(page, rankingUrl) {
-  const firstUrl = contestRankingPageUrl(rankingUrl, 1);
-  await gotoStable(page, firstUrl);
-  const firstProps = await readNextPageProps(page);
+  const result = await collectPaginatedRecords({
+    maxPages: config.maxRankingPages || 100,
+    label: '比赛排行榜',
+    keyOf: contestRankingRecordKey,
+    loadPage: async pageNumber => {
+      await gotoStable(page, contestRankingPageUrl(rankingUrl, pageNumber));
+      const pageProps = await readNextPageProps(page);
+      if (pageNumber > 1) await delay(requestDelayMs());
+      return pageProps;
+    },
+    recordsFromPage: pageProps => pageProps.listData?.list,
+    totalFromPage: pageProps => pageProps.listData?.total
+  });
+  const firstProps = result.firstPage || {};
   const firstListData = firstProps.listData || {};
-  const firstRecords = Array.isArray(firstListData.list) ? firstListData.list : [];
-  const total = Number(firstListData.total || firstRecords.length || 0);
-  const pageSize = contestRankingPageSize(rankingUrl, firstListData, firstRecords);
-  const pageCount = Math.max(1, Math.ceil((total || firstRecords.length || pageSize) / pageSize));
-  const maxPages = Math.max(1, Number(config.maxRankingPages || 100));
-  const records = [...firstRecords];
-
-  for (let pageNumber = 2; pageNumber <= Math.min(pageCount, maxPages); pageNumber++) {
-    const pageUrl = contestRankingPageUrl(rankingUrl, pageNumber);
-    await gotoStable(page, pageUrl);
-    const pageProps = await readNextPageProps(page);
-    const pageRecords = Array.isArray(pageProps.listData?.list) ? pageProps.listData.list : [];
-    if (!pageRecords.length) break;
-    records.push(...pageRecords);
-    await delay(requestDelayMs());
-  }
-
-  const uniqueRecords = uniqueBy(records, contestRankingRecordKey);
-  if (total && uniqueRecords.length < total) {
-    console.warn(`比赛排行榜已读取 ${uniqueRecords.length}/${total} 名学生；请检查 maxRankingPages 或页面访问权限。`);
-  } else if (pageCount > 1) {
-    console.log(`比赛排行榜分页读取完成：${uniqueRecords.length}/${total || uniqueRecords.length} 名学生，${Math.min(pageCount, maxPages)} 页。`);
+  if (result.pagesRead > 1) {
+    console.log(`比赛排行榜分页读取完成：${result.records.length}/${result.total || result.records.length} 名学生，${result.pagesRead} 页。`);
   }
 
   return {
     ...firstProps,
     listData: {
       ...firstListData,
-      list: uniqueRecords,
-      total: total || uniqueRecords.length
+      list: result.records,
+      total: result.total || result.records.length
     }
   };
+}
+
+function homeworkRankingRecordKey(record) {
+  return String(record?.userInfo?.userId || `${record?.order || ''}:${record?.userInfo?.nickName || ''}`);
 }
 
 function contestRankingPageUrl(rankingUrl, pageNumber) {
@@ -780,32 +723,30 @@ function contestRankingPageUrl(rankingUrl, pageNumber) {
   return url.href;
 }
 
-function contestRankingPageSize(rankingUrl, listData, records) {
-  const urlPageSize = Number(new URL(rankingUrl).searchParams.get('pageSize'));
-  const configuredPageSize = Number(config.contestRankingPageSize || config.rankingPageSize || 0);
-  const total = Number(listData.total || 0);
-  return urlPageSize
-    || Number(listData.pageSize || listData.size || 0)
-    || configuredPageSize
-    || (total > records.length && records.length < 20 ? 20 : Math.max(1, records.length || 20));
-}
-
 function contestRankingRecordKey(record) {
   return String(record?.userId || `${record?.rankOrder || record?.realRankOrder || ''}:${record?.nickName || ''}`);
 }
 
 async function collectContestQuestionLinks(page, { questionList, pageProps, contestTeamCode }) {
   const apiLinks = buildContestQuestionLinksFromList(questionList, contestTeamCode);
-  if (apiLinks.length) return apiLinks;
-
   const nextLinks = buildContestQuestionLinksFromList(pageProps?.questionList, contestTeamCode);
-  if (nextLinks.length) {
-    console.log('比赛题面链接已通过页面数据生成。');
-    return nextLinks;
-  }
-
   const domLinks = await collectQuestionLinks(page, { allowEmpty: true });
-  if (domLinks.length) return domLinks;
+  const sources = [
+    { name: '题目接口', links: apiLinks, priority: 3 },
+    { name: '页面数据', links: nextLinks, priority: 2 },
+    { name: '页面链接', links: domLinks, priority: 1 }
+  ].filter(source => source.links.length);
+  const selected = sources.sort((left, right) =>
+    right.links.length - left.links.length || right.priority - left.priority
+  )[0];
+  if (selected) {
+    if (sources.some(source => source.links.length !== selected.links.length)) {
+      console.warn(`比赛题单来源数量不一致（${sources.map(source => `${source.name}${source.links.length}题`).join('、')}），将采用最完整的${selected.name}并在排行榜阶段继续校验。`);
+    } else if (selected.name !== '题目接口') {
+      console.log(`比赛题面链接已通过${selected.name}生成。`);
+    }
+    return selected.links;
+  }
 
   await saveDebugPage(page, '未识别到比赛题目链接');
   throw new Error('没有识别到比赛题目链接，也没有从比赛题目接口中拿到 acgoQuestionId。请运行 npm run inspect，并检查 debug 目录。');
@@ -821,7 +762,7 @@ function buildContestQuestionLinksFromList(questionList, contestTeamCode) {
       label: question.questionTitle || question.title || question.name || `T${index + 1}`
     };
   }).filter(Boolean);
-  return uniqueBy(links, item => item.url);
+  return uniqueByFirst(links, item => item.url);
 }
 
 function contestProblemQuestionId(question) {
@@ -942,23 +883,26 @@ async function collectContestQuestionListFromApi(api, rankingUrl) {
 
 async function collectContestSubmissions(api, dataset, contestTeamCode, rankingUrl) {
   const examId = new URL(rankingUrl).searchParams.get('examId') || '';
+  const hasExpectedSubmissions = dataset.students.some(student =>
+    student.problemResults.some(result => Number(result.submitCount) > 0)
+  );
   if (!examId) {
-    console.warn('比赛链接缺少 examId，无法读取比赛提交代码。');
+    if (hasExpectedSubmissions) throw new Error('比赛链接缺少 examId，无法完整读取已存在的比赛提交代码');
     return;
   }
 
   const tasks = dataset.students.flatMap(student => {
     student.submissions = [];
-    return student.problemResults
-      .filter(result => Number(result.submitCount) > 0)
-      .map(result => ({ student, result }));
+    return student.problemResults.map(result => ({ student, result }));
   });
   let cursor = 0;
+  const failures = [];
 
   await mapWithConcurrency(tasks, submissionApiConcurrency(), async ({ student, result }) => {
     const current = ++cursor;
     console.log(`读取比赛提交 ${current}/${tasks.length}：${student.username} / T${result.index} ${result.title}`);
     try {
+      const leaderboardSubmitCount = Number(result.submitCount) || 0;
       const submissions = await collectContestSubmissionAttemptsFromApi(api, {
         teamCode: contestTeamCode,
         examId,
@@ -967,18 +911,33 @@ async function collectContestSubmissions(api, dataset, contestTeamCode, rankingU
         questionKey: result.questionKey,
         questionTitle: `第${result.index}题：${result.title}`
       });
+      if (!submissions.length && leaderboardSubmitCount > 0) {
+        throw new Error(`排行榜显示 ${leaderboardSubmitCount} 次提交，但提交接口未返回代码`);
+      }
+      result.leaderboardSubmitCount = leaderboardSubmitCount;
+      result.submitCount = submissions.length;
       result.submissions = submissions;
       student.submissions.push(...submissions);
     } catch (error) {
       console.warn(`  比赛提交读取失败：${error.message}`);
       result.submissions = [];
+      failures.push(new Error(`${student.username} / T${result.index} ${result.title}：${error.message}`, { cause: error }));
     }
     await delay(requestDelayMs());
   });
 
+  throwIfCollectedFailures(failures, tasks.length, '比赛提交任务');
+
   for (const student of dataset.students) {
     student.submissions = sortSubmissionsByAttempt(dedupeSubmissions(student.submissions));
     student.summary.totalSubmitCount = student.submissions.length;
+    for (const result of student.problemResults) {
+      const header = `T${result.index}：${result.title}`;
+      const scoreAndTime = String(student.cells?.[header] || '').split(/，提交\d+次/u)[0];
+      student.cells[header] = result.submissions.length
+        ? `${scoreAndTime}，提交${result.submissions.length}次`
+        : scoreAndTime;
+    }
   }
 }
 
@@ -1001,8 +960,8 @@ async function collectContestSubmissionAttemptsFromApi(api, entry) {
       teamCode: entry.teamCode,
       id: String(record.id)
     });
-    const code = Array.isArray(detail?.answer) ? String(detail.answer[0] || '') : String(detail?.answer || record.answer?.[0] || '');
-    if (!code) return null;
+    const rawCode = Array.isArray(detail?.answer) ? detail.answer[0] : (detail?.answer || record.answer?.[0]);
+    const code = requireSubmissionCode(rawCode, record.id);
     return {
       submissionId: String(record.id),
       questionTitle: entry.questionTitle,
@@ -1025,15 +984,22 @@ function buildContestDataset({ id, questionUrl, rankingUrl, rawProblems, pagePro
   const contestInfo = pageProps.contestInfo || {};
   const apiQuestions = Array.isArray(questionList) ? questionList : [];
   const nextQuestions = Array.isArray(pageProps.questionList) ? pageProps.questionList : [];
-  const orderSource = apiQuestions.length ? apiQuestions : nextQuestions;
+  const rankingRecords = Array.isArray(pageProps.listData?.list) ? pageProps.listData.list : [];
+  const orderSource = resolveContestQuestionOrder({
+    apiQuestions,
+    pageQuestions: nextQuestions,
+    rawProblems,
+    rankingRecords
+  });
   const rawProblemByAcgoId = new Map(rawProblems.map((problem, index) => [
     String(problem.questionId || extractQuestionId(problem.url) || index + 1),
     problem
   ]));
 
   const problems = orderSource.map((question, index) => {
-    const acgoQuestionId = question.acgoQuestionId || extractQuestionId(rawProblems[index]?.url || '') || question.questionId;
-    const rawProblem = rawProblemByAcgoId.get(String(acgoQuestionId)) || rawProblems[index] || {};
+    const rawProblemAtIndex = rawProblems[question.rawProblemIndex ?? index];
+    const acgoQuestionId = question.acgoQuestionId || extractQuestionId(rawProblemAtIndex?.url || '') || question.questionId;
+    const rawProblem = rawProblemByAcgoId.get(String(acgoQuestionId)) || rawProblemAtIndex || {};
     const title = question.questionTitle || stripProblemCode(rawProblem.title || rawProblem.label || `T${index + 1}`);
     return {
       ...rawProblem,
@@ -1055,14 +1021,15 @@ function buildContestDataset({ id, questionUrl, rankingUrl, rawProblems, pagePro
     '总用时',
     ...problems.map(problem => `T${problem.index}：${problem.title}`)
   ];
-  const records = Array.isArray(pageProps.listData?.list) ? pageProps.listData.list : [];
+  const records = rankingRecords.filter(record => !teacherUserMatcher.excludes(record?.userId));
+  const displayRanks = rebaseCompetitionRanks(records, record => record.rankOrder ?? record.realRankOrder);
   const students = records.map((record, rowIndex) => {
     const username = cleanName(record.nickName || `用户${record.userId || rowIndex + 1}`);
     const userId = String(record.userId || '');
     const key = `${userId}:${username}`;
     const answerByQuestionId = new Map((record.rank || []).map(answer => [String(answer.questionId), answer]));
     const cells = {
-      名次: String(record.rankOrder ?? record.realRankOrder ?? ''),
+      名次: String(displayRanks[rowIndex]),
       参赛者: username,
       总分: formatContestScore(record.score, contestTotalScore(problems), record.penalty),
       总用时: formatDuration(record.penalty)
@@ -1089,6 +1056,7 @@ function buildContestDataset({ id, questionUrl, rankingUrl, rawProblems, pagePro
         fullScore: problem.fullScore,
         status,
         submitCount,
+        leaderboardSubmitCount: submitCount,
         solvedAt,
         time: answer?.cpuTime || answer?.cpuTime === 0 ? `${answer.cpuTime} ms` : '',
         knowledgeList: problem.knowledgeList || []
@@ -1131,10 +1099,12 @@ function buildContestDataset({ id, questionUrl, rankingUrl, rawProblems, pagePro
     problems: normalizeProblemsForFeedback(problems),
     ranking: {
       headers,
-      total: Number(pageProps.listData?.total || students.length),
+      total: students.length,
+      sourceTotal: Number(pageProps.listData?.total || rankingRecords.length),
       students
     },
-    students
+    students,
+    excludedTeacherCount: rankingRecords.length - students.length
   };
 }
 
@@ -1236,30 +1206,6 @@ function submissionAttemptNumber(value) {
   return match ? Number(match[0]) : 0;
 }
 
-function createResponseStore(page) {
-  const records = [];
-  const handler = async response => {
-    const contentType = response.headers()['content-type'] || '';
-    if (!/json/i.test(contentType)) return;
-    if (!/acgo\.cn/i.test(response.url())) return;
-    try {
-      const json = await response.json();
-      records.push({ url: response.url(), status: response.status(), json });
-    } catch {}
-  };
-  page.on('response', handler);
-  return {
-    count: () => records.length,
-    since: index => records.slice(index),
-    shapes: () => records.map(record => ({
-      url: redactUrl(record.url),
-      status: record.status,
-      shape: jsonShape(record.json)
-    })),
-    dispose: () => page.off('response', handler)
-  };
-}
-
 function createRequestStore(scope) {
   let apiHeaders = {};
   const handler = request => {
@@ -1292,63 +1238,20 @@ function createAcgoApi(context, requestStore) {
     const options = { headers };
     if (method === 'GET' && payload) options.params = payload;
     if (method === 'POST') options.data = payload || {};
-    const maxAttempts = Math.max(1, Number(config.apiRetryCount || 3));
-
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      try {
-        const response = method === 'GET'
-          ? await context.request.get(url, options)
-          : await context.request.post(url, options);
-        const text = await response.text();
-        let body;
-        try {
-          body = JSON.parse(text);
-        } catch {
-          throw new Error(`${method} ${endpoint} 返回的不是 JSON（HTTP ${response.status()}）`);
-        }
-        if (!response.ok() || Number(body?.code) !== 200) {
-          const message = `${method} ${endpoint} 失败：HTTP ${response.status()}，${body?.message || '未知错误'}`;
-          if (attempt < maxAttempts && isRetryableApiError(message, response.status())) {
-            await delay(500 * attempt);
-            continue;
-          }
-          throw new Error(message);
-        }
-        return body.data;
-      } catch (error) {
-        if (attempt >= maxAttempts || !isRetryableApiError(error.message)) throw error;
-        await delay(500 * attempt);
-      }
-    }
+    return requestAcgoApiWithRetry({
+      method,
+      endpoint,
+      maxAttempts: Math.max(1, Number(config.apiRetryCount || 3)),
+      makeRequest: () => method === 'GET'
+        ? context.request.get(url, options)
+        : context.request.post(url, options),
+      wait: delay
+    });
   };
   return {
     get: (endpoint, params) => call('GET', endpoint, params),
     post: (endpoint, data) => call('POST', endpoint, data)
   };
-}
-
-function isRetryableApiError(message, status = 0) {
-  return Number(status) >= 500
-    || /socket hang up|ECONNRESET|ETIMEDOUT|Timeout|network|fetch failed|ECONNREFUSED|EAI_AGAIN/i.test(String(message || ''));
-}
-
-function jsonShape(value, depth = 0) {
-  if (depth > 4) return '…';
-  if (Array.isArray(value)) return value.length ? [`Array(${value.length})`, jsonShape(value[0], depth + 1)] : ['Array(0)'];
-  if (!value || typeof value !== 'object') return typeof value;
-  return Object.fromEntries(Object.entries(value).slice(0, 50).map(([key, child]) => [key, jsonShape(child, depth + 1)]));
-}
-
-function redactUrl(value) {
-  try {
-    const url = new URL(value);
-    for (const key of [...url.searchParams.keys()]) {
-      if (/token|cookie|auth|session|ticket/i.test(key)) url.searchParams.set(key, '[REDACTED]');
-    }
-    return url.href;
-  } catch {
-    return value;
-  }
 }
 
 async function saveDebugPage(page, name) {
@@ -1358,14 +1261,12 @@ async function saveDebugPage(page, name) {
   await page.screenshot({ path: path.join(debugDirectory, `${basename}.png`), fullPage: true }).catch(() => {});
 }
 
-async function writeCodeEvidenceFiles({ classroomDataset, contestDataset, dailySummaryMarkdown }) {
-  await fs.writeFile(path.join(rootDirectory, 'README.md'), renderCodeEvidenceReadme({ classroomDataset, contestDataset, dailySummaryMarkdown }), 'utf8');
-  await fs.writeFile(path.join(rootDirectory, '今日总结.md'), `${dailySummaryMarkdown.trim()}\n`, 'utf8');
-  await fs.mkdir(promptsDirectory, { recursive: true });
-  await fs.writeFile(path.join(promptsDirectory, '家长反馈生成提示词.md'), renderFeedbackPrompt({ dailySummaryMarkdown }), 'utf8');
-  await fs.writeFile(path.join(promptsDirectory, '批量处理说明.md'), renderBatchInstructions({ hasDailySummary: Boolean(dailySummaryMarkdown?.trim()) }), 'utf8');
+async function writeCodeEvidenceFiles({ classroomDataset, contestDataset, prompt }) {
+  await fs.writeFile(path.join(rootDirectory, 'README.md'), renderCodeEvidenceReadme({ classroomDataset, contestDataset }), 'utf8');
+  await fs.writeFile(path.join(rootDirectory, '提示词.md'), `${String(prompt || '').trim()}\n`, 'utf8');
 
   const studentDirectories = new Map();
+  const studentMaterialPaths = [];
   const directoryFor = async student => {
     const key = student.userId ? `id:${student.userId}` : `name:${student.username}`;
     if (!studentDirectories.has(key)) {
@@ -1379,15 +1280,18 @@ async function writeCodeEvidenceFiles({ classroomDataset, contestDataset, dailyS
   for (const student of classroomDataset?.students || []) {
     const directory = await directoryFor(student);
     await fs.writeFile(path.join(directory, '课堂练习.md'), renderStudent(student, classroomDataset), 'utf8');
+    studentMaterialPaths.push(`students/${path.basename(directory)}/课堂练习.md`);
   }
 
   for (const student of contestDataset?.students || []) {
     const directory = await directoryFor(student);
     await fs.writeFile(path.join(directory, '今日比赛.md'), renderContestStudent(student, contestDataset), 'utf8');
+    studentMaterialPaths.push(`students/${path.basename(directory)}/今日比赛.md`);
   }
+  return studentMaterialPaths;
 }
 
-function renderCodeEvidenceReadme({ classroomDataset, contestDataset, dailySummaryMarkdown }) {
+function renderCodeEvidenceReadme({ classroomDataset, contestDataset }) {
   const chunks = [
     '# ACGO 代码证据包',
     '',
@@ -1397,19 +1301,14 @@ function renderCodeEvidenceReadme({ classroomDataset, contestDataset, dailySumma
     '',
     '- `作业题目.md`：课堂练习题面汇总。',
     '- `比赛题目.md`：今日比赛题面汇总。',
-    '- `今日总结.md`：老师手动填写的当日学习目标、重难点和易错点。',
     '- `students/学生名-用户ID/课堂练习.md`：该学生课堂练习每题每次提交代码。',
     '- `students/学生名-用户ID/今日比赛.md`：该学生比赛每题每次提交代码。',
-    '- `prompts/家长反馈生成提示词.md`：生成家长反馈时建议使用的提示词。',
-    '- `prompts/批量处理说明.md`：批量处理多个学生时的操作说明。',
+    '- `提示词.md`：提交给 AI 的完整任务提示词。',
     '- `raw/summary.json`：结构化原始数据。',
+    '- 以上 README、排行榜、完成情况、`raw/` 等只供本地核验，不进入提交给 AI 的 ZIP。',
     ''
   ];
   chunks.push('## 本次数据', '');
-  if (dailySummaryMarkdown?.trim()) {
-    const title = dailySummaryMarkdown.split(/\r?\n/).map(line => line.trim()).find(line => line && !line.startsWith('#')) || '已填写';
-    chunks.push(`- 今日总结：${title.replace(/^#+\s*/, '')}`);
-  }
   if (classroomDataset) {
     chunks.push(`- 课堂练习：${classroomDataset.title || `作业 ${classroomDataset.id}`}，${classroomDataset.problems.length} 题，${classroomDataset.students.length} 名学生。`);
   }
@@ -1417,8 +1316,18 @@ function renderCodeEvidenceReadme({ classroomDataset, contestDataset, dailySumma
     chunks.push(`- 今日比赛：${contestDataset.title || `比赛 ${contestDataset.id}`}，${contestDataset.problems.length} 题，${contestDataset.students.length} 名学生。`);
   }
   chunks.push('', '## 给 AI 的建议', '');
-  chunks.push('请先使用 `prompts/家长反馈生成提示词.md`，再让 AI 读取某个学生文件夹下的 `课堂练习.md` 和 `今日比赛.md`。反馈应依据每题得分、提交次数、通过时间和完整代码，说明今日掌握情况、薄弱点和后续练习建议。');
+  chunks.push('请把最终 ZIP 提交给 AI，并要求它先读取根目录的 `提示词.md`，再结合题面和每位学生的提交材料。题目列表中的横线标题保留为上午/下午必做或选做的分组标记，AI 应结合其后的题目理解分组。');
   return `${chunks.join('\n')}\n`;
+}
+
+function assertExcludedTeachersAbsent(...datasets) {
+  for (const dataset of datasets.filter(Boolean)) {
+    for (const student of [...(dataset.students || []), ...(dataset.ranking?.students || [])]) {
+      if (teacherUserMatcher.excludes(student.userId)) {
+        throw new Error('教师账号过滤断言失败：最终数据仍包含配置的教师用户 ID');
+      }
+    }
+  }
 }
 
 function normalizeProblemsForFeedback(problems) {
@@ -1668,12 +1577,6 @@ function safeFilename(value) {
   return sanitizeFilename(String(value || '').replace(/\s+/g, '_')) || 'unnamed';
 }
 
-function uniqueBy(items, keyOf) {
-  const map = new Map();
-  for (const item of items) map.set(keyOf(item), item);
-  return [...map.values()];
-}
-
 async function mapWithConcurrency(items, concurrency, worker) {
   const list = [...(items || [])];
   if (!list.length) return [];
@@ -1692,7 +1595,7 @@ async function mapWithConcurrency(items, concurrency, worker) {
 }
 
 function submissionApiConcurrency() {
-  return positiveInteger(config.submissionApiConcurrency ?? config.submissionConcurrency, 4);
+  return positiveInteger(config.submissionApiConcurrency, 4);
 }
 
 function submissionDetailConcurrency() {

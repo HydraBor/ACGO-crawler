@@ -5,7 +5,9 @@ output/
 .env
 .env.*
 *.local.json
-今日总结.md
 .DS_Store
 .vscode/
 .idea/
+dist/
+launcher/bin/
+launcher/cache/
