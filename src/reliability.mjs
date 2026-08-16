@@ -139,7 +139,8 @@ export async function collectPaginatedRecords({
   totalFromPage,
   keyOf,
   maxPages = 100,
-  label = '分页数据'
+  label = '分页数据',
+  allowTotalMismatchOnEmptyPage = false
 }) {
   const limit = positiveInteger(maxPages, 100);
   let firstPage;
@@ -152,12 +153,38 @@ export async function collectPaginatedRecords({
     const pageTotal = Number(totalFromPage(pageData) || 0);
     if (Number.isFinite(pageTotal) && pageTotal > expectedTotal) expectedTotal = pageTotal;
 
-    const pageRecords = Array.isArray(recordsFromPage(pageData)) ? recordsFromPage(pageData) : [];
+    const pageRecords = Array.isArray(recordsFromPage(pageData))
+      ? recordsFromPage(pageData)
+      : [];
+
     if (!pageRecords.length) {
       if (expectedTotal && records.length < expectedTotal) {
-        throw new Error(`${label}第 ${pageNumber} 页为空，仅读取 ${records.length}/${expectedTotal} 条`);
+        if (!allowTotalMismatchOnEmptyPage) {
+          throw new Error(
+            `${label}第 ${pageNumber} 页为空，仅读取 ${records.length}/${expectedTotal} 条`
+          );
+        }
+
+        console.warn(
+          `${label}接口声明 ${expectedTotal} 条，实际读取 ${records.length} 条，`
+          + `后续页面为空，将以实际排行榜记录为准。`
+        );
+
+        return {
+          firstPage,
+          records,
+          total: records.length,
+          reportedTotal: expectedTotal,
+          pagesRead: pageNumber
+        };
       }
-      return { firstPage, records, total: expectedTotal || records.length, pagesRead: pageNumber };
+
+      return {
+        firstPage,
+        records,
+        total: expectedTotal || records.length,
+        pagesRead: pageNumber
+      };
     }
 
     const previousCount = records.length;

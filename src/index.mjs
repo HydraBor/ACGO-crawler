@@ -497,6 +497,9 @@ async function collectRankingFromApi(api, problems) {
     maxPages: config.maxRankingPages || 100,
     label: '作业排行榜',
     keyOf: homeworkRankingRecordKey,
+
+    allowTotalMismatchOnEmptyPage: true,
+
     loadPage: pageNumber => api.get(endpoint, {
       ...commonParams,
       page: String(pageNumber),
