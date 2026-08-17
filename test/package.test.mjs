@@ -157,13 +157,34 @@ async function zipEntries(zipPath, temporaryParent) {
       `$zip = '${psZipPath}'`,
       'Add-Type -AssemblyName System.IO.Compression.FileSystem',
       '$archive = [IO.Compression.ZipFile]::OpenRead($zip)',
-      'try { ($archive.Entries | ForEach-Object { $_.FullName }) -join "`n" } finally { $archive.Dispose() }'
+      'try {',
+      '  $archive.Entries | ForEach-Object {',
+      '    [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($_.FullName))',
+      '  }',
+      '} finally {',
+      '  $archive.Dispose()',
+      '}'
     ].join('; ');
-    const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-Command', script], { encoding: 'utf8' });
-    return stdout.trim().split(/\r?\n/).filter(Boolean);
+
+    const { stdout } = await execFileAsync(
+      'powershell.exe',
+      ['-NoProfile', '-Command', script],
+      { encoding: 'utf8' }
+    );
+
+    return stdout
+      .trim()
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map(line => Buffer.from(line.trim(), 'base64').toString('utf8'));
   }
 
   const script = 'import sys, zipfile; print("\\n".join(zipfile.ZipFile(sys.argv[1]).namelist()))';
-  const { stdout } = await execFileAsync('python3', ['-c', script, zipPath], { encoding: 'utf8' });
+  const { stdout } = await execFileAsync(
+    'python3',
+    ['-c', script, zipPath],
+    { encoding: 'utf8' }
+  );
+
   return stdout.trim().split(/\r?\n/).filter(Boolean);
 }
